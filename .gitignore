@@ -1,0 +1,11 @@
+# Build artifacts (binaries are published via GitHub Releases, never committed)
+go/frz-go
+go/frz-linux-*
+go/frz-darwin-*
+go/vendor/
+
+# Local frz data (config with API keys, sessions, exports)
+.frz/
+
+# OS noise
+.DS_Store
