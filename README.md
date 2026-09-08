@@ -35,6 +35,17 @@ Download the archive for your platform from
 chmod +x frz-* && sudo mv frz-* /usr/local/bin/frz
 ```
 
+> **macOS Gatekeeper note**: the release binaries are unsigned (built by CI),
+> so macOS may refuse to open them ("Apple cannot check it for malicious
+> software"). Run this once after downloading, or right-click → Open:
+>
+> ```bash
+> xattr -d com.apple.quarantine frz-darwin-arm64
+> ```
+>
+> Linux binaries are unaffected, and so is anything you build yourself
+> (`go install` below compiles locally and never trips Gatekeeper).
+
 ### go install
 
 ```bash
