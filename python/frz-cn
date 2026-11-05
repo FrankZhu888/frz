@@ -1,0 +1,2228 @@
+#!/usr/bin/env python3
+"""
+frz - 一个类似 Gemini CLI 的多模型命令行聊天工具。
+
+特性：
+  - 支持 Anthropic (Claude) / OpenAI / Google Gemini / OpenAI Responses 协议四种后端
+  - 核心仅使用 Python 标准库（urllib），无必装第三方依赖
+  - 回复带 Markdown 终端渲染（标题/粗体/列表/表格/代码块等）；可选安装 pygments 让代码块获得语法高亮
+  - 代码块内的手绘框线图自动重对齐右边界，修正模型数错 CJK 宽度画歪的框
+  - 会话可保存 / 恢复 / 列出 / 导出 Markdown，历史保存在 ~/.frz/sessions/*.json
+  - REPL 内支持斜杠命令: /help /save /rename /resume /list /new /export /edit /system /model /baseurl /history /clear /exit
+  - REPL 输入增强：Tab 补全（斜杠命令/会话名/@路径）、/edit 编辑器多行输入、
+    /history 长输出自动分页、/resume 不带名字直接续聊最近的会话
+  - REPL 本地命令：!命令，以及直接输入 ls / pwd / cd；输出仅在本地显示，不进入模型上下文
+  - openai_responses 支持 @文本/@图片附件，可使用文件名、相对路径或绝对路径；
+    文本/图片单文件上限分别为 2/10 MiB，单次总量 15 MiB；快照独立存储，会话仅保存引用
+  - openai_responses 新会话默认允许模型按需求自动联网搜索，可用 /web on|off 或 --web/--no-web 控制
+
+用法示例：
+  # 直接开始一个新会话（默认使用 Anthropic claude-sonnet-4-6）
+  frz --api-key sk-ant-xxxx
+
+  # 指定 provider / model
+  frz --provider openai --model gpt-4o --api-key sk-xxxx
+
+  # 用环境变量提供 key（更安全，不会出现在 shell 历史里）
+  export ANTHROPIC_API_KEY=sk-ant-xxxx
+  frz
+
+  # 恢复上次的会话
+  frz --resume my-session
+
+  # 列出所有已保存的会话
+  frz --list-sessions
+
+  # 把默认 provider/model/api-key 写进配置文件，以后不用每次传
+  frz config set --provider anthropic --model claude-sonnet-4-6 --api-key sk-ant-xxxx
+
+  # 对接 Responses API 协议的服务（例如火山方舟 Ark），支持真正的流式打字机输出
+  export ARK_API_KEY=ark-xxxx
+  frz --provider openai_responses --model kimi-k3 \\
+      --base-url https://ark.cn-beijing.volces.com/api/plan/v3
+  # 也可以把 base-url/model 存进配置，以后只需 --provider openai_responses
+  frz config set --provider openai_responses \\
+      --model kimi-k3 --base-url https://ark.cn-beijing.volces.com/api/plan/v3 --api-key ark-xxxx
+"""
+
+__version__ = "1.5.1"
+__author__ = "Frank Zhu <zhuzhenquan@bytedance.com>"
+
+import argparse
+import base64
+import hashlib
+import http.client
+import json
+import platform as _platform
+
+_PLAT = f"{_platform.system().lower()}/{_platform.machine()}"  # darwin/arm64 形式，与 Go 版对齐
+import os
+import random
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+APP_DIR = Path.home() / ".frz"
+SESS_DIR = APP_DIR / "sessions"
+ATTACH_DIR = APP_DIR / "attachments"
+EXPORT_DIR = APP_DIR / "exports"
+CONFIG_FILE = APP_DIR / "config.json"
+
+DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-4o",
+    "gemini": "gemini-2.5-flash",
+    # openai_responses: 走 OpenAI 新版 Responses API 协议 (/responses, SSE 流)
+    # 下面这个默认值对应火山方舟 (Volcengine Ark) 的示例配置，可按需通过
+    # --model / --base-url 或 config 覆盖，也可以直接改这里的默认值。
+    "openai_responses": "kimi-k3",
+}
+
+ENV_KEY_NAMES = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openai_responses": "ARK_API_KEY",
+}
+
+# 各 provider 的默认 API base url。anthropic/openai/gemini 的 url 是各家固定的，
+# 直接写死在对应的 call_xxx 函数里；openai_responses 协议本身可能对接不同厂商
+# (火山方舟、或未来 OpenAI 官方 Responses API 等)，所以这里给一个可覆盖的默认值。
+DEFAULT_BASE_URLS = {
+    "openai_responses": "https://ark.cn-beijing.volces.com/api/plan/v3",
+}
+
+# 使用真正流式打字机输出的 provider（边生成边打印，而不是等全部返回再打印）
+STREAMING_PROVIDERS = {"openai_responses"}
+
+# @附件限制：拒绝超限文件，不做静默截断。Base64 后请求体约再增大 1/3。
+MAX_ATTACHMENTS = 8
+MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024
+# 无引用附件保留一天再允许 clean 删除，避免误删其他 frz 进程刚写入的快照。
+ATTACHMENT_CLEAN_GRACE_SECONDS = 24 * 60 * 60
+
+
+# --------------------------------------------------------------------------
+# 基础工具
+# --------------------------------------------------------------------------
+
+def ensure_dirs():
+    SESS_DIR.mkdir(parents=True, exist_ok=True)
+    ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+    for directory in (SESS_DIR, ATTACH_DIR):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    # 修正早期版本按 umask 创建的会话权限；无法修改时下次原子保存仍会覆盖为 0600。
+    for path in SESS_DIR.glob("*.json"):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _write_json_atomic(path, data):
+    """以 0600 权限原子写入 JSON，失败时保留原文件并清理临时文件。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(data, ensure_ascii=False, indent=2)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    ensure_dirs()
+    _write_json_atomic(CONFIG_FILE, cfg)
+
+
+def session_path(name):
+    safe = "".join(c for c in name if c.isalnum() or c in ("-", "_", ".")) or "session"
+    return SESS_DIR / f"{safe}.json"
+
+
+def list_sessions():
+    ensure_dirs()
+    sessions = []
+    for f in sorted(SESS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            sessions.append((f.stem, data))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return sessions
+
+
+def _attachment_blob_path(digest):
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise RuntimeError("会话中的附件 SHA-256 无效")
+    return ATTACH_DIR / digest
+
+
+def _store_attachment(data):
+    """按内容哈希原子写入附件；相同内容已存在时直接复用。"""
+    ensure_dirs()
+    digest = hashlib.sha256(data).hexdigest()
+    path = ATTACH_DIR / digest
+    if path.is_file():
+        try:
+            if hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+                os.utime(path, None)  # 重新引用旧快照时刷新保护期，避免并发 clean 误删
+                return digest
+        except OSError:
+            pass  # 读取失败时通过下面的原子替换修复
+
+    fd, temp_name = tempfile.mkstemp(prefix=".frz-attachment-", dir=ATTACH_DIR)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+    return digest
+
+
+def _attachment_bytes(attachment):
+    """读取新格式的外部快照，同时兼容旧会话的内嵌 content/data。"""
+    digest = attachment.get("sha256")
+    if digest:
+        path = _attachment_blob_path(digest)
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            raise RuntimeError(f"附件快照缺失或不可读: {attachment.get('name', '?')} ({digest[:12]})") from e
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError(f"附件快照校验失败: {attachment.get('name', '?')} ({digest[:12]})")
+        return data
+
+    kind = attachment.get("kind")
+    if kind == "image" and attachment.get("data"):
+        try:
+            return base64.b64decode(attachment["data"], validate=True)
+        except (ValueError, TypeError) as e:
+            raise RuntimeError(f"旧版图片附件 Base64 损坏: {attachment.get('name', '?')}") from e
+    if kind == "text" and attachment.get("content") is not None:
+        return attachment["content"].encode("utf-8")
+    raise RuntimeError(f"附件数据不完整: {attachment.get('name', '?')}")
+
+
+def _attachment_text(attachment):
+    try:
+        return _attachment_bytes(attachment).decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"文本附件不是有效的 UTF-8: {attachment.get('name', '?')}") from e
+
+
+def _externalize_session_attachments(session):
+    """保存前迁移旧版内嵌附件，确保 JSON 中只保留快照引用。"""
+    for message in session.get("messages", []):
+        for attachment in message.get("attachments", []):
+            if attachment.get("sha256"):
+                continue
+            data = _attachment_bytes(attachment)
+            attachment["sha256"] = _store_attachment(data)
+            attachment["size"] = len(data)
+            attachment.pop("content", None)
+            attachment.pop("data", None)
+
+
+def _referenced_attachment_hashes():
+    """收集所有会话引用；任何会话损坏都中止清理，宁可保留多余快照。"""
+    references = set()
+    for path in SESS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(f"会话 {path.name} 无法解析，已跳过附件清理") from e
+        for message in data.get("messages", []):
+            for attachment in message.get("attachments", []):
+                digest = attachment.get("sha256")
+                if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                    references.add(digest)
+    return references
+
+
+def _clean_unreferenced_attachments(max_age=ATTACHMENT_CLEAN_GRACE_SECONDS):
+    """删除超过保护期且无引用的快照，返回 (删除字节数, 删除数量, 跳过数量)。"""
+    ensure_dirs()
+    references = _referenced_attachment_hashes()
+    now = time.time()
+    removed_bytes = removed_count = skipped = 0
+    for path in ATTACH_DIR.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{64}", path.name) or path.name in references:
+            continue
+        try:
+            if not path.is_file():
+                continue
+            age = now - path.stat().st_mtime
+            if age < max_age:
+                skipped += 1
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            removed_bytes += size
+            removed_count += 1
+        except FileNotFoundError:
+            pass
+    return removed_bytes, removed_count, skipped
+
+
+def save_session(session, force=False):
+    """保存会话，返回保存路径；未保存返回 None。
+    空会话（0 条消息）默认跳过不保存，避免 /resume、/new、/exit 前的兜底保存
+    产生一堆空壳会话文件；显式 /save 时传 force=True 强制保存。"""
+    if not force and not session.get("messages"):
+        return None
+    ensure_dirs()
+    _externalize_session_attachments(session)
+    session["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    path = session_path(session["name"])
+    _write_json_atomic(path, session)
+    return path
+
+
+def default_session_name():
+    # 默认会话名带日期时间，方便在列表里一眼认出，例如 session-20260827-153012
+    return datetime.now().strftime("session-%Y%m%d-%H%M%S")
+
+
+def rename_session_file(old_name, new_name):
+    """把会话文件从 old_name 改名为 new_name，返回 (ok, message)。"""
+    old_path = session_path(old_name)
+    new_path = session_path(new_name)
+    if not old_path.exists():
+        return False, f"找不到会话「{old_name}」"
+    if new_path != old_path and new_path.exists():
+        return False, f"会话「{new_name}」已存在，请换个名字"
+    data = json.loads(old_path.read_text(encoding="utf-8"))
+    data["name"] = new_name
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    _write_json_atomic(new_path, data)
+    if new_path != old_path:
+        old_path.unlink()
+    return True, new_path
+
+
+def load_session(name):
+    path = session_path(name)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def export_session(session, dest=None):
+    """把会话导出为 Markdown 文件，返回 (文件路径, 是否覆盖了已有文件)。
+    消息内容本身就是 Markdown，按角色加二级标题原样导出；元信息放在开头的引用块里。"""
+    lines = [f"# {session['name']}", ""]
+    lines.append(f"> provider={session['provider']}  model={session['model']}  "
+                 f"创建于 {session.get('created_at', '?')}")
+    if session.get("system_prompt"):
+        lines.append(f"> system: {session['system_prompt']}")
+    for m in session["messages"]:
+        lines += ["", f"## {'用户' if m['role'] == 'user' else '助手'}", "", m["content"]]
+        for label in _attachment_labels(m):
+            lines += ["", f"> 附件: {label}"]
+
+    path = Path(dest).expanduser() if dest else EXPORT_DIR / f"{session['name']}.md"
+    if not path.suffix:
+        path = path.with_suffix(".md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    overwritten = path.exists()
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path, overwritten
+
+
+def new_session(name, provider, model, system_prompt, base_url=None, web_search=None):
+    if web_search is None:
+        web_search = provider == "openai_responses"
+    return {
+        "name": name,
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,  # 仅部分 provider（如 openai_responses）会用到
+        "system_prompt": system_prompt,
+        "web_search": bool(web_search),  # True = 允许模型自动调用 web_search
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "messages": [],  # content 为文本；user 消息可另带 attachments
+    }
+
+
+# --------------------------------------------------------------------------
+# @ 本地文件/图片附件
+# --------------------------------------------------------------------------
+
+def _parse_at_references(text):
+    """提取行首或空白后的 @路径，返回 (去掉引用后的文本, 路径列表)。
+
+    支持 @file、@~/file、@/tmp/file、@\"含空格路径\"、@'含空格路径'；
+    @@ 表示字面量 @，email 这类前面不是空白的内容不会被当成附件。
+    """
+    out, refs = [], []
+    i = 0
+    while i < len(text):
+        if text[i] != "@" or (i > 0 and not text[i - 1].isspace()):
+            out.append(text[i])
+            i += 1
+            continue
+        if i + 1 < len(text) and text[i + 1] == "@":
+            out.append("@")
+            i += 2
+            continue
+
+        i += 1  # 跳过 @
+        if i >= len(text):
+            out.append("@")
+            break
+
+        if text[i] in ('"', "'"):
+            quote = text[i]
+            i += 1
+            chars = []
+            closed = False
+            while i < len(text):
+                c = text[i]
+                if c == "\\" and i + 1 < len(text) and text[i + 1] in (quote, "\\"):
+                    chars.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    closed = True
+                    i += 1
+                    break
+                chars.append(c)
+                i += 1
+            if not closed:
+                raise ValueError("@附件路径的引号未闭合")
+            path = "".join(chars)
+            if i < len(text) and not text[i].isspace():
+                raise ValueError("@附件的引用路径后需要空格分隔")
+        else:
+            start = i
+            while i < len(text) and not text[i].isspace():
+                i += 1
+            path = text[start:i]
+
+        if not path:
+            out.append("@")
+        else:
+            refs.append(path)
+    return "".join(out).strip(), refs
+
+
+def _image_media_type(data):
+    """按文件签名识别常见图片，不信任扩展名。"""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _load_attachment(reference, total_bytes):
+    path = Path(reference).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"附件不存在或不是普通文件: {reference}")
+
+    size = path.stat().st_size
+    if total_bytes + size > MAX_TOTAL_ATTACHMENT_BYTES:
+        raise ValueError(f"附件总大小超过 {MAX_TOTAL_ATTACHMENT_BYTES // 1024 // 1024} MB: {path.name}")
+    data = path.read_bytes()
+    media_type = _image_media_type(data)
+    base = {"name": path.name, "path": str(path), "size": size}
+
+    if media_type:
+        if size > MAX_IMAGE_ATTACHMENT_BYTES:
+            raise ValueError(f"图片超过 {MAX_IMAGE_ATTACHMENT_BYTES // 1024 // 1024} MB 限制: {path.name}")
+        return {**base, "kind": "image", "media_type": media_type,
+                "sha256": _store_attachment(data)}, size
+
+    if size > MAX_TEXT_ATTACHMENT_BYTES:
+        raise ValueError(f"文本附件超过 {MAX_TEXT_ATTACHMENT_BYTES // 1024 // 1024} MB 限制: {path.name}")
+    if b"\x00" in data:
+        raise ValueError(f"不支持的二进制文件（目前仅支持 UTF-8 文本和 PNG/JPEG/GIF/WEBP 图片）: {path.name}")
+    try:
+        content = data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"文本附件必须是 UTF-8 编码: {path.name}") from e
+    return {**base, "kind": "text", "sha256": _store_attachment(data)}, size
+
+
+def _build_user_message(user_input, provider):
+    """把一条 REPL 输入转换成内部消息；附件内容取发送时快照。"""
+    text, references = _parse_at_references(user_input)
+    if references and provider != "openai_responses":
+        raise ValueError("@附件目前仅支持 openai_responses provider")
+    if len(references) > MAX_ATTACHMENTS:
+        raise ValueError(f"单次最多添加 {MAX_ATTACHMENTS} 个附件")
+
+    attachments = []
+    total_bytes = 0
+    for ref in references:
+        attachment, size = _load_attachment(ref, total_bytes)
+        attachments.append(attachment)
+        total_bytes += size
+
+    if not text and attachments:
+        text = "请分析附件。"
+    message = {"role": "user", "content": text}
+    if attachments:
+        message["attachments"] = attachments
+    return message
+
+
+def _format_size(size):
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def _attachment_labels(message):
+    labels = []
+    for a in message.get("attachments", []):
+        kind = "图片" if a.get("kind") == "image" else "文本"
+        labels.append(f"{a.get('name', '?')} ({kind}, {_format_size(a.get('size', 0))})")
+    return labels
+
+
+# --------------------------------------------------------------------------
+# API 调用（各家 HTTP 接口不同，统一封装成 call(messages, system, model, api_key) -> str）
+# --------------------------------------------------------------------------
+
+def _http_post_json(url, headers, payload, timeout=300):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} 错误: {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"网络错误: {e.reason}") from e
+    except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        raise RuntimeError(f"读取响应失败: {e}") from e
+
+
+def call_anthropic(messages, system, model, api_key, max_tokens=8192, base_url=None, on_delta=None, on_reasoning=None):
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
+    }
+    if system:
+        payload["system"] = system
+    result = _http_post_json(url, headers, payload)
+    parts = result.get("content", [])
+    return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+
+
+def call_openai(messages, system, model, api_key, max_tokens=8192, base_url=None, on_delta=None, on_reasoning=None):
+    url = (base_url.rstrip("/") + "/chat/completions") if base_url else "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+    }
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msgs.extend({"role": m["role"], "content": m["content"]} for m in messages)
+    # 新模型（o1/o3 等）只认 max_completion_tokens，旧参数 max_tokens 会被 400 拒绝
+    payload = {"model": model, "messages": msgs, "max_completion_tokens": max_tokens}
+    result = _http_post_json(url, headers, payload)
+    return result["choices"][0]["message"]["content"]
+
+
+def call_gemini(messages, system, model, api_key, max_tokens=8192, base_url=None, on_delta=None, on_reasoning=None):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    headers = {"content-type": "application/json"}
+    contents = []
+    for m in messages:
+        role = "model" if m["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": m["content"]}]})
+    payload = {
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    }
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    result = _http_post_json(url, headers, payload)
+    candidates = result.get("candidates", [])
+    if not candidates:
+        return "(模型没有返回内容，可能被安全过滤拦截)"
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts)
+
+
+def _responses_content(message):
+    """把内部消息转换为 Responses API 的 text/image content parts。"""
+    attachments = message.get("attachments", [])
+    text_sections = [message.get("content", "")]
+    for a in attachments:
+        if a.get("kind") != "text":
+            continue
+        name = json.dumps(a.get("name", "attachment"), ensure_ascii=False)
+        path = json.dumps(a.get("path", ""), ensure_ascii=False)
+        text_sections.append(
+            f"\n\n<attached_file name={name} path={path}>\n"
+            f"{_attachment_text(a)}\n</attached_file>"
+        )
+
+    parts = []
+    text = "".join(text_sections)
+    if text or not attachments:
+        parts.append({"type": "input_text", "text": text})
+    for a in attachments:
+        kind = a.get("kind")
+        if kind == "text":
+            continue
+        if kind != "image":
+            raise RuntimeError(f"未知附件类型: {kind}")
+        media_type = a.get("media_type")
+        if not media_type:
+            raise RuntimeError(f"图片附件缺少 MIME 类型: {a.get('name', '?')}")
+        data = base64.b64encode(_attachment_bytes(a)).decode("ascii")
+        parts.append({"type": "input_image",
+                      "image_url": f"data:{media_type};base64,{data}"})
+    return parts
+
+
+def call_openai_responses(messages, system, model, api_key, max_tokens=8192, base_url=None,
+                          on_delta=None, on_reasoning=None, web_search=False, on_search=None):
+    """
+    对接 OpenAI 新版 Responses API 协议 (POST {base_url}/responses)，SSE 流式返回。
+    协议形态参考自 Open WebUI 的 Pipe function：
+      - 请求体用 input（角色+分段内容，input_text/input_image）+ instructions（即 system）
+      - 返回事件: response.output_text.delta / response.reasoning_summary_text.delta /
+                 response.completed / response.failed
+    很多国内厂商（如火山方舟 Ark）用这套协议暴露 OpenAI 兼容能力，所以单独做一个 provider。
+    on_delta: 可选回调，每收到一段正文 delta 就调用一次，用于实现打字机效果。
+    返回值：拼接后的完整回复文本（不包含 reasoning 部分）。
+    """
+    if not base_url:
+        raise RuntimeError("openai_responses provider 需要 base_url，请用 --base-url 指定。")
+
+    url = base_url.rstrip("/") + "/responses"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    input_items = [
+        {"role": m["role"], "content": _responses_content(m)}
+        for m in messages
+    ]
+    payload = {"model": model, "input": input_items, "stream": True}
+    if web_search:
+        # 仅声明工具，保持 tool_choice=auto，由模型按当前需求决定是否搜索。
+        payload["tools"] = [{"type": "web_search"}]
+    if system:
+        payload["instructions"] = system
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    full_text = []
+    current_event = None
+    completed = False
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    continue
+
+                if line.startswith("event:"):
+                    current_event = line[len("event:"):].strip()
+                    continue
+
+                if not line.startswith("data:"):
+                    continue
+
+                data_str = line[len("data:"):].strip()
+                event_for_data = current_event
+                current_event = None  # 无论数据是否有效，事件名都不得泄漏到下一条记录
+                if not data_str or data_str == "[DONE]":
+                    continue
+
+                try:
+                    evt = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = evt.get("type") or event_for_data
+
+                if etype == "response.output_text.delta":
+                    delta_text = evt.get("delta", "")
+                    if delta_text:
+                        full_text.append(delta_text)
+                        if on_delta:
+                            on_delta(delta_text)
+
+                elif etype == "response.reasoning_summary_text.delta":
+                    # 思考过程增量，不计入正文；通过 on_reasoning 通知前端"模型在思考"，
+                    # 用于更新等待指示（显示推理摘要全文太吵，只用作心跳信号）。
+                    if on_reasoning:
+                        on_reasoning(evt.get("delta", ""))
+
+                elif etype and etype.startswith("response.web_search_call."):
+                    if on_search:
+                        on_search(etype.rsplit(".", 1)[-1])
+
+                elif etype in ("error", "response.failed"):
+                    response = evt.get("response", {})
+                    err = response.get("error", {}).get("message")
+                    if not err:
+                        err = evt.get("error", {}).get("message", "unknown error")
+                    raise RuntimeError(f"上游返回失败: {err}")
+
+                elif etype == "response.incomplete":
+                    response = evt.get("response", {})
+                    details = response.get("status_details") or {}
+                    reason = details.get("reason") or response.get("status") or "unknown reason"
+                    raise RuntimeError(f"上游返回不完整: {reason}")
+
+                elif etype == "response.completed":
+                    completed = True
+                    break
+
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} 错误: {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"网络错误: {e.reason}") from e
+    except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        raise RuntimeError(f"读取响应流失败: {e}") from e
+
+    if not completed:
+        raise RuntimeError("响应流在 response.completed 前结束，已丢弃可能不完整的回答")
+    return "".join(full_text)
+
+
+CALLERS = {
+    "anthropic": call_anthropic,
+    "openai": call_openai,
+    "gemini": call_gemini,
+    "openai_responses": call_openai_responses,
+}
+
+
+def call_model(provider, messages, system, model, api_key, base_url=None, on_delta=None,
+               on_reasoning=None, web_search=False, on_search=None):
+    if provider not in CALLERS:
+        raise ValueError(f"未知 provider: {provider}")
+    kwargs = {"base_url": base_url, "on_delta": on_delta, "on_reasoning": on_reasoning}
+    if provider == "openai_responses":
+        kwargs.update({"web_search": web_search, "on_search": on_search})
+    return CALLERS[provider](messages, system, model, api_key, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# 终端 Markdown 渲染
+#   纯标准库实现的轻量渲染：标题/粗体/斜体/行内代码/列表/引用/分隔线/代码块。
+#   如果环境里装了 pygments（pip install pygments），代码块自动升级为语法高亮。
+#   输出被重定向、TERM=dumb 或设置了 NO_COLOR 时自动降级为纯文本。
+# --------------------------------------------------------------------------
+
+try:  # 可选依赖：pygments 仅用于代码块语法高亮，没装则降级为整体单色
+    from pygments import format as _pg_format
+    from pygments import lex as _pg_lex
+    from pygments.formatters import Terminal256Formatter
+    from pygments.lexers import TextLexer, get_lexer_by_name
+    from pygments.token import Token as _PgToken
+    from pygments.util import ClassNotFound as _PgClassNotFound
+    HAS_PYGMENTS = True
+except ImportError:
+    HAS_PYGMENTS = False
+
+
+def _detect_color_support():
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("TERM", "dumb") in ("", "dumb"):
+        return False
+    return sys.stdout.isatty()
+
+
+USE_COLOR = _detect_color_support()
+
+_ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "italic": "\033[3m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "gray": "\033[90m",
+    # 行内代码（命令/参数/路径等）：蓝紫色 rgb(177,185,249)，取自 Claude Code 主题的
+    # suggestion 色，真彩色直出。只用前景色、无底色块，保持"素"风格。
+    "inline_code": "\033[38;2;177;185;249m",
+}
+
+
+def stylize(text, *styles):
+    if not USE_COLOR or not text:
+        return text
+    return "".join(_ANSI[s] for s in styles) + text + _ANSI["reset"]
+
+
+# 行内元素：代码 > 粗体 > 斜体，顺序即优先级（从左到右先匹配先生效）。
+# 下划线形式的粗斜体加了词边界保护，避免误伤 snake_case 这类变量名；
+# 星号形式按 CommonMark 侧翼规则要求 * 内侧不能是空格，避免把 2 * 3 * 4 渲染成斜体。
+_INLINE_RE = re.compile(
+    r"(`[^`\n]+`)"
+    r"|(\*\*[^\s*](?:[^\n*]*[^\s*])?\*\*)"
+    r"|((?<!\w)__[^_\n]+?__(?!\w))"
+    r"|(\*[^\s*](?:[^\n*]*[^\s*])?\*)"
+    r"|((?<!\w)_[^_\n]+?_(?!\w))"
+)
+
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$")
+_HR_RE = re.compile(r"^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$")
+_UL_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_OL_RE = re.compile(r"^(\s*)(\d{1,3})[.)]\s+(.*)$")
+_FENCE_RE = re.compile(r"^\s{0,3}```([^`]*)\s*$")
+
+# 表格：表头行先挂起，下一行命中分隔行（|---|---|）才确认进入表格模式，
+# 避免把正文里偶然出现的 | 误判成表格。
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_ANSI_STRIP_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _is_table_row(line):
+    s = line.strip()
+    return s.startswith("|") and s.count("|") >= 2
+
+
+def _split_table_row(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    # 制表符按固定 4 空格展开：终端里 tab 会跳到 8 的倍数列，
+    # 宽度无法预判，展开成空格后计宽和显示才一致
+    return [c.strip().replace("\t", "    ") for c in s.split("|")]
+
+
+def _col_align(cell):
+    cell = cell.strip()
+    left, right = cell.startswith(":"), cell.endswith(":")
+    if left and right:
+        return "center"
+    if right:
+        return "right"
+    return "left"
+
+
+def _disp_width(s):
+    """显示宽度：去掉 ANSI 转义后按终端列宽计算（中文等宽字符占 2 列）。
+    终端按字素簇（grapheme cluster）渲染，组合序列整体只占一个 emoji 位，
+    逐码点计宽会把表格撑歪，所以按簇规则处理：
+      - ZWJ (U+200D) 把多个 emoji 粘成一个簇，簇内后续字符不再计宽（👨‍💻 整体 2 列）
+      - 肤色修饰符 (U+1F3FB..U+1F3FF) 附着在前一个 emoji 上，自身零宽
+      - 组合记号 (Mn/Me，如 U+0301 声调、U+20E3 键帽)、格式控制符 (Cf) 零宽
+      - 变体选择符 VS16 (U+FE0F) 把前一个 1 宽字符提升为 2 宽 emoji 表现（✈️）；
+        VS15 (U+FE0E) 强制文本表现，宽度不变"""
+    s = _ANSI_STRIP_RE.sub("", s)
+    width = 0
+    last_one_col = False  # 上一个计宽字符是否只占 1 列（VS16/ZWJ 需要补宽）
+    in_zwj = False
+    for ch in s:
+        cp = ord(ch)
+        if cp == 0x200D:  # ZWJ：零宽，并把下一个字符并入当前簇
+            in_zwj = True
+            continue
+        if cp == 0xFE0F:  # VS16：强制 emoji 表现，1 宽基础字符实际按 2 宽显示
+            if last_one_col:
+                width += 1
+                last_one_col = False
+            continue
+        if cp == 0xFE0E:  # VS15：强制文本表现，不改变宽度
+            continue
+        if 0x1F3FB <= cp <= 0x1F3FF:  # emoji 肤色修饰符：零宽
+            continue
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf"):  # 组合记号/格式符：零宽
+            continue
+        if in_zwj:
+            # ZWJ 后续字符并入当前簇，不单独计宽；若基础字符只有 1 宽
+            # （如 🏳️‍🌈 已由 VS16 补宽，这里兜底其它窄基字符），簇整体补到 2 列
+            in_zwj = False
+            if last_one_col:
+                width += 1
+                last_one_col = False
+            continue
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        width += w
+        last_one_col = w == 1
+    return width
+
+
+def _pad_cell(s, width, align):
+    gap = width - _disp_width(s)
+    if gap <= 0:
+        return s
+    if align == "right":
+        return " " * gap + s
+    if align == "center":
+        left = gap // 2
+        return " " * left + s + " " * (gap - left)
+    return s + " " * gap
+
+
+def render_inline(line):
+    """渲染一行内的行内 Markdown 元素（粗体/斜体/行内代码）。"""
+    if not USE_COLOR:
+        return line
+
+    def _sub(m):
+        code, bold1, bold2, it1, it2 = m.groups()
+        if code:
+            return stylize(code[1:-1], "inline_code")
+        if bold1 or bold2:
+            return stylize((bold1 or bold2)[2:-2], "bold")
+        it = it1 or it2
+        return stylize(it[1:-1], "italic")
+
+    return _INLINE_RE.sub(_sub, line)
+
+
+def render_line(line):
+    """渲染代码块之外的一行 Markdown（标题/列表/引用/分隔线 + 行内元素）。"""
+    m = _HEADING_RE.match(line)
+    if m:
+        # 标题保持默认前景色（白/黑随终端主题）只加粗，与 Claude Code 一致
+        return stylize(m.group(1), "bold")
+    if _HR_RE.match(line):
+        return stylize("─" * 40, "gray")
+    stripped = line.lstrip()
+    if stripped.startswith(">"):
+        indent = line[: len(line) - len(stripped)]
+        return indent + stylize("▎", "gray") + " " + render_inline(stripped[1:].lstrip())
+    m = _UL_RE.match(line)
+    if m:
+        return m.group(1) + "• " + render_inline(m.group(2))
+    m = _OL_RE.match(line)
+    if m:
+        return m.group(1) + m.group(2) + ". " + render_inline(m.group(3))
+    return render_inline(line)
+
+
+def _pick_pygments_style():
+    """根据 COLORFGBG 猜终端背景明暗，选一个可读的 pygments 配色（默认按深色）。"""
+    cfb = os.environ.get("COLORFGBG", "")
+    if ";" in cfb:
+        try:
+            bg = int(cfb.split(";")[-1])
+            if bg in (7, 15):  # 白/浅灰背景
+                return "default"
+        except ValueError:
+            pass
+    return "monokai"
+
+
+# pygments 部分配色（如 monokai）会带上自己的背景色，把终端背景盖掉很难看，
+# 这里把 256 色 / 真彩色的背景码从输出里剥掉，只保留前景色。
+def _strip_pygments_bg(text):
+    text = re.sub(r";48;5;\d+", "", text)
+    text = re.sub(r";48;2;\d+;\d+;\d+", "", text)
+    return re.sub(r"\033\[48;[25];[\d;]*m", "", text)
+
+
+def _demote_compound_number_tokens(tokens):
+    """把"数字+分隔符+数字"复合片段里的伪数字 token 降级为普通文本。
+    bash 等 lexer 没有 IP/日期/时间/MAC/版本号的概念，会把 192.168.1.1、2026/09/08、
+    10:00:01、52:54:00:1a:2b:3c 的局部当数字字面量单独着色（monokai 里数字是紫色），
+    看起来像渲染 bug。
+    规则：连续 token 拼起来匹配 数字(分隔符数字){2,} 才整段降级——
+    要求至少两个分隔符，避免误伤 10/3、16:9 这类真实数字。
+    另外按行处理：一行里一旦有复合片段被降级（基本是日志/时间行），
+    该行的零散数字（如 ctime 里的日、年）也一并降级，避免同一条时间半紫半白。"""
+    # 先按行分组（token 里带 \n），逐行处理
+    lines, cur = [], []
+    for t in tokens:
+        cur.append(t)
+        if "\n" in t[1]:
+            lines.append(cur)
+            cur = []
+    if cur:
+        lines.append(cur)
+
+    out = []
+    for line in lines:
+        processed, demoted_any = _demote_line(line)
+        if demoted_any:
+            # 行内统一：零散裸数字也降级，保持整行观感一致
+            processed = [
+                (_PgToken.Text, v) if (t in _PgToken.Literal.Number and re.fullmatch(r"\d+", v)) else (t, v)
+                for t, v in processed
+            ]
+        out.extend(processed)
+    return out
+
+
+def _demote_line(tokens):
+    """单行内执行复合数字片段降级，返回 (tokens, 是否有片段被降级)。"""
+    out = []
+    demoted_any = False
+    i, n = 0, len(tokens)
+    while i < n:
+        ttype, value = tokens[i]
+        if ttype in _PgToken.Literal.Number and re.fullmatch(r"\d+(\.\d+)?", value):
+            # 尽量向后拼接十六进制+分隔符的 token，看整体是否构成复合数字片段
+            # 字符集说明：a-f 覆盖 MAC 地址；- 覆盖 ISO 日期和 UUID；
+            # t/T 覆盖 ISO 8601 的 T 连接符（2026-09-08T10:00:01）
+            j = i + 1
+            acc = value
+            while j < n and re.fullmatch(r"[0-9a-fA-FtT./:-]+", tokens[j][1]):
+                acc += tokens[j][1]
+                j += 1
+            if re.fullmatch(r"[0-9a-fA-FtT]+([./:-][0-9a-fA-FtT]+){2,}", acc):
+                out.extend((_PgToken.Text, tokens[k][1]) for k in range(i, j))
+                demoted_any = True
+                i = j
+                continue
+        out.append((ttype, value))
+        i += 1
+    return out, demoted_any
+
+
+# shell 会话块的提示符（[user@host ~]# / user@host:~$）。bash lexer 不认识提示符：
+# [ ] 会被当 Operator 染红、# 后的命令被当注释整段染灰，所以需要单独处理。
+_SHELL_SESSION_LANGS = {"bash", "sh", "shell", "zsh", "console", "shell-session", ""}
+_PROMPT_RE = re.compile(
+    r"^(\s*(?:\[[\w.\-]+@[\w.\-]+[^\]]*\]|[\w.\-]+@[\w.\-]+:[^\n]*?)[#$]\s*)(.*)$"
+)
+
+
+def _lex_shell_session(code, lexer):
+    """shell 会话块逐行处理：提示符前缀按普通文本，#/$ 后的命令仍按 bash 高亮。"""
+    out = []
+    for line in code.split("\n"):
+        m = _PROMPT_RE.match(line)
+        if m:
+            out.append((_PgToken.Text, m.group(1)))
+            if m.group(2):
+                out.extend(_pg_lex(m.group(2), lexer))
+        elif line:
+            out.extend(_pg_lex(line, lexer))
+        out.append((_PgToken.Text, "\n"))
+    return out
+
+
+def _highlight_code(code, lang):
+    """pygments 高亮代码，但对 IP/日期/时间/版本号片段做降级处理，并剥掉配色自带的背景色。
+    含 shell 提示符的代码块走会话模式，避免提示符被误染色。"""
+    try:
+        lexer = get_lexer_by_name(lang) if lang else TextLexer()
+    except _PgClassNotFound:
+        lexer = TextLexer()
+    is_shell = (lang or "").lower() in _SHELL_SESSION_LANGS
+    if is_shell and any(_PROMPT_RE.match(l) for l in code.split("\n")):
+        # 会话模式按行切分后逐行 lex，pygments 默认 ensurenl=True 会给每个片段
+        # 补一个换行，叠加本函数自己补的行尾 \n 会产生幻影空行，所以这里
+        # 单独建一个 ensurenl=False 的 lexer
+        try:
+            session_lexer = get_lexer_by_name(lang, ensurenl=False) if lang else TextLexer(ensurenl=False)
+        except _PgClassNotFound:
+            session_lexer = TextLexer(ensurenl=False)
+        tokens = _lex_shell_session(code, session_lexer)
+    else:
+        tokens = list(_pg_lex(code, lexer))
+    tokens = _demote_compound_number_tokens(tokens)
+    formatter = Terminal256Formatter(style=_pick_pygments_style())
+    return _strip_pygments_bg(_pg_format(tokens, formatter))
+
+
+# --------------------------------------------------------------------------
+# 代码块手绘框线重对齐
+#   模型画 ┌─┐│└─┘ 这类框图时靠"心算"数 CJK 字符宽度，经常少数 1~2 列，
+#   导致右边界犬牙交错（典型症状：没有 emoji 等特殊符号，右边框仍然对不齐）。
+#   这里对空标记/text 代码块里的框线做重对齐：把每条竖边向右补齐到组内最宽列。
+#   只插入空格/─、从不删除内容，所以即使误判也不会破坏图形。
+# --------------------------------------------------------------------------
+
+# 有"竖边"语义的框线字符；─ ┬ ┴ ┼ 是横线/交叉，不参与列对齐
+_BOX_VBARS = frozenset("│┌┐└┘├┤")
+# 只对这些语言标记的代码块做重对齐（空标记是模型手绘框图最常见的形态），
+# 避免改动 python 等代码字符串里偶然出现的框线字符
+_BOX_ART_LANGS = {"", "text", "txt", "plain"}
+# 同级竖边允许的最大参差（列）：超过说明是刻意画的不同宽度的框，或混入异常行，
+# 强行对齐会把整幅图拉变形，不如保留模型原样
+_BOX_EDGE_TOLERANCE = 4
+
+
+def _box_edges(line):
+    """返回行内所有竖边字符的 (字符下标, 显示列) 列表，显示列从 0 开始。
+    含 tab 的行返回 None：tab 在终端跳到 8 的倍数列，宽度无法预判，不参与对齐。"""
+    if "\t" in line:
+        return None
+    edges = []
+    col = 0
+    for i, ch in enumerate(line):
+        if ch in _BOX_VBARS:
+            edges.append((i, col))
+        col += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return edges
+
+
+def _align_box_edge(group, level):
+    """把组内各行倒数第 -level 条竖边对齐到同一显示列（level=-1 是最外侧右边界）。
+    只把边向右推（竖边前插入空格；横线框的边前插入 ─），不删减任何内容。"""
+    particip = []
+    for idx, line in enumerate(group):
+        edges = _box_edges(line)
+        # level=-1 要求至少两条边（左右都有，排除 ├─ 开头的树形行）；
+        # level=-2 要求至少三条（只有两条时倒数第二边是左边界，不能动）
+        if edges is not None and len(edges) >= 1 - level:
+            particip.append((idx, edges[level]))
+    if len(particip) < 2:
+        return group
+    cols = [col for _, (_, col) in particip]
+    if max(cols) - min(cols) > _BOX_EDGE_TOLERANCE:
+        return group
+    target = max(cols)
+    out = list(group)
+    for idx, (ci, col) in particip:
+        gap = target - col
+        if gap <= 0:
+            continue
+        line = out[idx]
+        # 横线框（┌──┐/└──┘）补 ─ 保持边框连续，内容行补空格
+        fill = "─" if ci > 0 and line[ci - 1] == "─" else " "
+        out[idx] = line[:ci] + fill * gap + line[ci:]
+    return out
+
+
+def _realign_group(group):
+    """对一个框组执行竖边对齐。
+    结构完全一致（各行竖边数相同，如并排的多个同款框）：从内到外逐级对齐
+    所有竖边——对齐内层会把外层顶歪，所以最深的先做，最外层最后收尾。
+    结构混合（嵌套框/框外注释等，同级竖边在不同行里语义不同）：只对最外
+    两层右边界，更深的级别容易张冠李戴，交给参差保护兜底。"""
+    counts = {len(_box_edges(l)) for l in group}
+    if len(counts) == 1:
+        n_edges = counts.pop()
+        for level in range(-(n_edges - 1), 0):
+            group = _align_box_edge(group, level)
+    else:
+        group = _align_box_edge(group, -2)
+        group = _align_box_edge(group, -1)
+    return group
+
+
+def _realign_box_art(code):
+    """重对齐代码块里的手绘框线图，连续的框线行（≥3 行）视为一个框组。"""
+    lines = [l.rstrip() for l in code.split("\n")]
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        if _box_edges(lines[i]):
+            j = i
+            while j < n and _box_edges(lines[j]):
+                j += 1
+            group = lines[i:j]
+            if len(group) >= 3:
+                group = _realign_group(group)
+            out.extend(group)
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
+class MarkdownRenderer:
+    """逐行渲染 Markdown。代码块和表格都先攒行、再一次性格式化：
+    代码块攒到结束围栏（便于 pygments 整体高亮），表格攒到最后一行（便于对齐列宽）。"""
+
+    def __init__(self):
+        self._in_code = False
+        self._code_lang = ""
+        self._code_lines = []
+        self._table_pending = None  # 疑似表头行，等下一行（分隔行）确认
+        self._in_table = False
+        self._table_rows = []
+        self._table_aligns = []
+
+    def feed_line(self, line):
+        """喂入一行，返回要打印的内容；返回 None 表示暂不输出（围栏行或代码块/表格攒行中）。"""
+        out = []
+
+        # 表格状态机（代码块内的 | 不触发表格）
+        if not self._in_code:
+            if self._table_pending is not None:
+                if _TABLE_SEP_RE.match(line):
+                    self._in_table = True
+                    self._table_rows = [self._table_pending]
+                    self._table_aligns = [_col_align(c) for c in _split_table_row(line)]
+                    self._table_pending = None
+                    return None
+                out.append(render_line(self._table_pending))
+                self._table_pending = None
+            if self._in_table:
+                if _is_table_row(line):
+                    self._table_rows.append(line)
+                    return None
+                out.append(self._render_table())
+                self._in_table = False
+                self._table_rows = []
+
+        # 代码块围栏
+        m = _FENCE_RE.match(line)
+        if m:
+            if self._in_code:
+                self._in_code = False
+                out.append(self._render_code())
+                self._code_lines = []
+            else:
+                self._in_code = True
+                self._code_lang = m.group(1).strip()
+                self._code_lines = []
+            return "\n".join(out) or None
+        if self._in_code:
+            self._code_lines.append(line)
+            return "\n".join(out) or None
+
+        # 疑似表头行：先挂起，看下一行是不是分隔行
+        if _is_table_row(line):
+            self._table_pending = line
+            return "\n".join(out) or None
+
+        out.append(render_line(line))
+        return "\n".join(out)
+
+    def flush(self):
+        """输入结束时调用：渲染挂起的表格或未闭合代码块的残留内容。"""
+        out = []
+        if self._table_pending is not None:
+            out.append(render_line(self._table_pending))
+            self._table_pending = None
+        if self._in_table:
+            out.append(self._render_table())
+            self._in_table = False
+            self._table_rows = []
+        if self._in_code:
+            self._in_code = False
+            if self._code_lines:
+                out.append(self._render_code())
+        return "\n".join(out) or None
+
+    def _render_table(self):
+        rows = [_split_table_row(r) for r in self._table_rows]
+        ncols = max(len(r) for r in rows)
+        rows = [r + [""] * (ncols - len(r)) for r in rows]
+        aligns = (self._table_aligns + ["left"] * ncols)[:ncols]
+        rendered = [[render_inline(c) for c in r] for r in rows]
+        widths = [max(_disp_width(r[i]) for r in rendered) for i in range(ncols)]
+        segs = ["─" * (w + 2) for w in widths]  # +2 是单元格两侧的空格
+
+        def _border(left, mid, right):
+            return stylize(left + mid.join(segs) + right, "gray")
+
+        def _row(cells, cell_style=None):
+            parts = []
+            for i in range(ncols):
+                c = cells[i]
+                if cell_style:
+                    c = stylize(c, cell_style)
+                parts.append(_pad_cell(c, widths[i], aligns[i]))
+            bar = stylize("│", "gray")
+            return bar + " " + (" " + bar + " ").join(parts) + " " + bar
+
+        # 全封闭实线框：上下边框 + 表头/每行之间的分割线（Claude Code 风格）
+        lines = [_border("┌", "┬", "┐")]
+        lines.append(_row(rendered[0], "bold"))
+        lines.append(_border("├", "┼", "┤"))
+        for i, r in enumerate(rendered[1:]):
+            if i:
+                lines.append(_border("├", "┼", "┤"))
+            lines.append(_row(r))
+        lines.append(_border("└", "┴", "┘"))
+        return "\n".join(lines)
+
+    def _render_code(self):
+        code = "\n".join(self._code_lines)
+        if (self._code_lang or "").lower() in _BOX_ART_LANGS:
+            # 模型手绘框图常因 CJK 宽度数错导致右边界不齐，先做一次重对齐
+            code = _realign_box_art(code)
+        bar = stylize("▎", "gray")
+        if USE_COLOR and HAS_PYGMENTS:
+            rendered = _highlight_code(code, self._code_lang).rstrip("\n")
+            return "\n".join(f"{bar} {l}" for l in rendered.split("\n"))
+        return "\n".join(f"{bar} {l}" for l in code.split("\n")) if code else ""
+
+
+def render_markdown(text):
+    """把一整段 Markdown 文本渲染成终端字符串。"""
+    renderer = MarkdownRenderer()
+    out = []
+    for line in text.split("\n"):
+        rendered = renderer.feed_line(line)
+        if rendered is not None:
+            out.append(rendered)
+    tail = renderer.flush()
+    if tail is not None:
+        out.append(tail)
+    return "\n".join(out)
+
+
+class StreamRenderer:
+    """流式输出的行缓冲渲染器：攒到完整一行再渲染（Markdown 语法按行闭合），
+    兼顾实时性与渲染正确性——标记跨 delta 拆分（如 `**粗` + `体**`）也能正确处理。"""
+
+    def __init__(self, on_output=None):
+        self._renderer = MarkdownRenderer()
+        self._buf = ""
+        self._on_output = on_output
+
+    def feed(self, text):
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit(line)
+
+    def finish(self):
+        if self._buf:
+            self._emit(self._buf)
+            self._buf = ""
+        tail = self._renderer.flush()
+        if tail is not None:
+            self._print(tail)
+
+    def _print(self, text):
+        if self._on_output:
+            callback = self._on_output
+            self._on_output = None
+            callback()
+        print(text, flush=True)
+
+    def _emit(self, line):
+        rendered = self._renderer.feed_line(line)
+        if rendered is not None:
+            self._print(rendered)
+
+
+class ThinkingIndicator:
+    """等待模型响应期间的动画指示（另起线程刷新，不阻塞网络读取）。
+    风格复刻 Claude Code 的 spinner：✻ 星号 + 随机动词 + shimmer 扫光
+    （主体蓝 rgb(147,165,255)，亮团 rgb(177,195,255)，取自其主题色表）。
+    首个正文 delta 到达或请求结束时 stop()，指示行会被擦掉。"""
+
+    _GLYPH = "✻"
+    # 收到推理增量后随机选用的"卖萌动词"（对应 Claude Code 的 Vibing/Pondering 等）
+    _VERBS = ["思考中", "推演中", "斟酌中", "酝酿中", "琢磨中",
+              "推敲中", "演算中", "检索中", "编织中", "神游中"]
+    _BASE = "\033[38;2;147;165;255m"    # claudeBlue_FOR_SYSTEM_SPINNER
+    _HOT = "\033[38;2;177;195;255m"     # claudeBlueShimmer_FOR_SYSTEM_SPINNER
+    _RESET = "\033[0m"
+    _SHIMMER_WIDTH = 4  # 扫光亮团的字符宽度
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._state = "等待响应"
+        self._t0 = 0.0
+
+    def start(self):
+        if not sys.stdout.isatty():
+            return
+        self._t0 = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_state(self, state, force=False):
+        # 普通推理增量只设置初始思考状态；搜索事件可强制覆盖该状态。
+        if force or self._state == "等待响应":
+            self._state = state
+
+    def _shimmer(self, text, frame):
+        """整行蓝色，一团更亮的颜色随帧从左到右循环扫过（Claude Code 招牌效果）。"""
+        if not USE_COLOR:
+            return text
+        n = len(text)
+        cycle = n + self._SHIMMER_WIDTH
+        pos = frame % cycle
+        out = []
+        for i, ch in enumerate(text):
+            in_hot = pos <= i < pos + self._SHIMMER_WIDTH
+            out.append((self._HOT if in_hot else self._BASE) + ch)
+        return "".join(out) + self._RESET
+
+    def _run(self):
+        frame = 0
+        while not self._stop.wait(0.12):
+            elapsed = int(time.monotonic() - self._t0)
+            ts = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+            text = f"{self._GLYPH} {self._state} {ts}"
+            sys.stdout.write("\r" + self._shimmer(text, frame) + "\033[K")
+            sys.stdout.flush()
+            frame += 1
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+            sys.stdout.write("\r\033[K")  # 擦掉指示行
+            sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# REPL
+# --------------------------------------------------------------------------
+
+def _change_directory(target=None):
+    """cd 是唯一需要跨命令保留状态的 shell 内建命令。"""
+    path = Path(target).expanduser() if target else Path.home()
+    try:
+        os.chdir(path)
+        print(os.getcwd())
+    except OSError as e:
+        print(stylize(f"cd: {e}", "red"))
+
+
+def _run_shell_command(command):
+    """执行用户显式输入的本地命令；输出不进入模型会话。"""
+    print(stylize(f"$ {command}", "gray"), flush=True)
+    try:
+        result = subprocess.run(command, shell=True, executable="/bin/sh")
+        if result.returncode != 0:
+            print(stylize(f"[命令退出码: {result.returncode}]", "gray"))
+    except KeyboardInterrupt:
+        print("\n(命令已中断)")
+    except OSError as e:
+        print(stylize(f"命令执行失败: {e}", "red"))
+
+
+def _handle_shell_input(user_input):
+    """处理 !命令，以及无需前缀的 ls/pwd/cd；其他输入仍发送给模型。"""
+    explicit = user_input.startswith("!")
+    command = user_input[1:].strip() if explicit else user_input
+    if explicit and not command:
+        print("用法: !<系统命令>，例如 !ls -la；单独 ! 不进入持续 shell。")
+        return True
+    if not explicit:
+        first = command.split(None, 1)[0].lower()
+        if first not in ("ls", "pwd", "cd"):
+            return False
+
+    try:
+        parts = shlex.split(command)
+    except ValueError as e:
+        print(stylize(f"命令解析失败: {e}", "red"))
+        return True
+    if not parts:
+        return True
+    if parts[0] == "cd" and len(parts) <= 2:
+        if len(parts) == 1:
+            _change_directory()
+        else:
+            _change_directory(parts[1])
+    else:
+        _run_shell_command(command)
+    return True
+
+
+def _format_history(messages):
+    """把消息列表格式化成 /history 要显示的文本（与之前逐条 print 的输出一致）。"""
+    out = []
+    for m in messages:
+        out.append("")
+        if m["role"] == "user":
+            for line in m["content"].split("\n"):
+                out.append(stylize("> ", "green") + line)
+            for label in _attachment_labels(m):
+                out.append(stylize("> ", "green") + f"[附件: {label}]")
+        else:
+            out.append(render_markdown(m["content"]))
+    return "\n".join(out)
+
+
+def _page_text(text):
+    """长文本交给分页器查看，避免顶穿终端 scrollback 缓冲区。
+    优先用 $PAGER，默认 less：-R 透传 ANSI 颜色，-F 不足一屏直接退出，
+    -X 退出后内容留在终端里（不进备用屏幕）。非 tty 或没有分页器时直接打印。"""
+    if not sys.stdout.isatty():
+        print(text)
+        return
+    cmd = (os.environ.get("PAGER") or "less").split()
+    if os.path.basename(cmd[0]) == "less":
+        cmd += ["-R", "-F", "-X"]
+    try:
+        subprocess.run(cmd, input=text.encode("utf-8"))
+    except (FileNotFoundError, OSError):
+        print(text)
+
+
+# Tab 补全用的斜杠命令清单（排序后补全菜单更可读）
+_REPL_COMMANDS = sorted([
+    "/help", "/save", "/rename", "/resume", "/list", "/new", "/export", "/edit",
+    "/system", "/model", "/baseurl", "/web", "/history", "/clear", "/exit", "/quit",
+])
+
+
+def _path_completion_matches(text):
+    """补全 @后的路径；含空格路径自动使用单引号，目录可继续补全。"""
+    raw = text[1:]
+    quote = raw[0] if raw[:1] in ('"', "'") else ""
+    if quote:
+        raw = raw[1:]
+    directory, base = os.path.split(raw)
+    read_dir = os.path.expanduser(directory or ".")
+    try:
+        entries = list(os.scandir(read_dir))
+    except OSError:
+        return []
+
+    matches = []
+    for entry in sorted(entries, key=lambda e: e.name):
+        if not base and entry.name.startswith("."):
+            continue
+        if not entry.name.startswith(base):
+            continue
+        candidate = os.path.join(directory, entry.name) if directory else entry.name
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            is_dir = False
+        if is_dir:
+            candidate += os.sep
+        needs_quote = any(c.isspace() for c in candidate)
+        active_quote = quote or ("'" if needs_quote else "")
+        closing_quote = active_quote if active_quote and not is_dir else ""
+        matches.append("@" + active_quote + candidate + closing_quote)
+        if len(matches) >= 100:
+            break
+    return matches
+
+
+def _completion_matches(buf, text):
+    """Tab 补全候选：会话名、斜杠命令，以及 @后的本地路径。"""
+    if text.startswith("@"):
+        return _path_completion_matches(text)
+    if buf.startswith("/resume ") or buf.startswith("/resume\t"):
+        return [name for name, _ in list_sessions() if name.startswith(text)]
+    if buf.startswith("/") and " " not in buf:
+        return [c for c in _REPL_COMMANDS if c.startswith(text)]
+    return []
+
+
+HELP_TEXT = """\
+可用命令：
+  会话管理
+    /save [名字]         保存当前会话（不写名字则沿用当前会话名）
+    /rename <新名字>     重命名当前会话
+    /resume [名字]       切换/恢复到另一个会话（不写名字则续聊最近的会话）
+    /list                列出所有已保存的会话
+    /new [名字]          开启一个新会话
+    /export [文件]       导出当前会话为 Markdown（默认 ~/.frz/exports/会话名.md）
+
+  会话配置
+    /system [提示词]     查看或设置 system prompt
+    /model [模型名]      查看或切换模型
+    /baseurl [地址]      查看或设置自定义 API base url（openai_responses 等 provider 需要）
+    /web [on|off]        查看或设置联网搜索；新会话默认 on，由模型自动决策
+
+  本地命令与附件（openai_responses）
+    !<命令>              本地执行命令，例如 !ls -la；输出不发送给模型
+    ls / pwd / cd       常用命令也可直接输入；cd 会保留工作目录
+    @<文件>             添加文本或图片附件，支持多个附件和 Tab 补全
+
+  其他
+    /edit                打开编辑器写多行消息（适合贴长日志/长问题），保存退出后发送
+    /history [N]         打印对话历史（N=只看最近 N 轮；长输出自动进入分页器）
+    /clear               清空当前会话的对话历史（保留 system prompt）
+    /help                显示本帮助
+    /exit 或 /quit       保存并退出
+"""
+
+
+def repl(session, api_key):
+    provider = session["provider"]
+    print(f"frz {__version__}  进入会话「{session['name']}」  provider={provider}  model={session['model']}")
+    print("输入 /help 查看命令，输入 /exit 保存并退出。\n")
+
+    # 启用 readline：解决两个问题——
+    #   1) 裸 input() 走终端规范模式，退格按字节删，中文等多字节字符删不干净；
+    #   2) macOS 规范模式单行上限 1024 字节，长输入会被静默截断。
+    # 注意 macOS 系统 Python 自带的是 libedit，对宽字符/折行/历史召回的光标计算有
+    # bug（表现为删除删不到行首、删完有残留），所以优先使用 gnureadline 包提供的
+    # 真正的 GNU readline（pip install gnureadline）；没装则退回系统 readline。
+    try:
+        import gnureadline as _rl
+    except ImportError:
+        try:
+            import readline as _rl
+        except ImportError:
+            _rl = None
+    if _rl is not None:
+        # 开启 bracketed paste：粘贴的多行文本作为整体一次提交（换行插入编辑缓冲区），
+        # 否则剩余行会被后续 input() 逐行读走，每一行都误触发一次 API 调用
+        try:
+            _rl.parse_and_bind("set enable-bracketed-paste on")
+        except Exception:
+            pass  # libedit 等不支持的实现静默跳过
+
+        # Tab 补全：行首斜杠命令、/resume 后的会话名。
+        # 分隔符只留空白：readline 默认分隔符含 - . 等符号，会把
+        # session-20260903-110531 这类会话名拆断、只剩最后一段参与补全
+        _comp = {"matches": []}  # state>0 的后续调用复用同一份候选
+
+        def _complete(text, state):
+            if state == 0:
+                _comp["matches"] = _completion_matches(_rl.get_line_buffer(), text)
+            try:
+                return _comp["matches"][state]
+            except IndexError:
+                return None
+
+        _rl.set_completer(_complete)
+        try:
+            _rl.set_completer_delims(" \t\n")
+            # macOS 系统 Python 自带的 libedit 与 GNU readline 的按键绑定语法不同
+            if _rl.__doc__ and "libedit" in _rl.__doc__:
+                _rl.parse_and_bind("bind ^I rl_complete")
+            else:
+                _rl.parse_and_bind("tab: complete")
+        except Exception:
+            pass  # 补全设置失败不影响正常使用，只是没有 Tab 补全
+
+    while True:
+        try:
+            user_input = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n(已中断，正在保存会话...)")
+            save_session(session)
+            break
+
+        if not user_input:
+            continue
+
+        if _handle_shell_input(user_input):
+            continue
+
+        if user_input.startswith("/"):
+            parts = user_input.split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+
+            if cmd in ("/exit", "/quit"):
+                path = save_session(session)
+                print(f"会话已保存到 {path}" if path else "(空会话，未保存)")
+                break
+
+            elif cmd == "/help":
+                print(HELP_TEXT)
+
+            elif cmd == "/save":
+                if arg and arg != session["name"] and session_path(arg).exists():
+                    print(f"会话「{arg}」已存在，请换个名字（以免覆盖已有会话）")
+                    continue
+                if arg:
+                    session["name"] = arg
+                path = save_session(session, force=True)
+                print(f"已保存到 {path}")
+
+            elif cmd == "/rename":
+                if not arg:
+                    print("用法: /rename <新名字>")
+                    continue
+                old_name = session["name"]
+                old_path = session_path(old_name)
+                if not old_path.exists() and not session.get("messages"):
+                    # 空会话尚未落盘时无需经过文件重命名，但仍要检查目标冲突。
+                    if session_path(arg).exists():
+                        print(f"会话「{arg}」已存在，请换个名字")
+                    else:
+                        session["name"] = arg
+                        print(f"已将会话「{old_name}」重命名为「{arg}」")
+                    continue
+                save_session(session)  # 先把最新内容落盘，再整体改名
+                ok, result = rename_session_file(old_name, arg)
+                if ok:
+                    session["name"] = arg
+                    print(f"已将会话「{old_name}」重命名为「{arg}」")
+                else:
+                    print(result)
+
+            elif cmd == "/resume":
+                target = arg
+                if not target:
+                    # 不带会话名：续聊最近更新的会话（排除当前会话）
+                    for name, _ in list_sessions():
+                        if name != session["name"]:
+                            target = name
+                            break
+                    if not target:
+                        print("没有可续聊的会话。")
+                        continue
+                save_session(session)
+                loaded = load_session(target)
+                if loaded is None:
+                    print(f"找不到会话「{target}」，输入 /list 查看已有会话。")
+                    continue
+                previous_provider = provider
+                session = loaded
+                provider = session["provider"]
+                # 同 provider 可保留命令行 Key；跨 provider 找不到新 Key 时禁止复用旧 Key。
+                api_key = _resumed_api_key(previous_provider, provider, api_key)
+                if not api_key:
+                    env_name = ENV_KEY_NAMES.get(provider, "对应环境变量")
+                    print(stylize(f"[注意] 找不到 {provider} 的 API Key（{env_name}），已阻止后续请求", "red"))
+                print(f"已切换到会话「{session['name']}」 provider={provider} model={session['model']}")
+
+            elif cmd == "/edit":
+                text = _edit_in_editor()
+                if text:
+                    kb = len(text.encode("utf-8")) // 1024
+                    if kb > 100:
+                        print(f"(编辑器内容共 {kb} KB，将整体发送)")
+                    send_message(session, text, provider, api_key)
+                else:
+                    print("(内容为空，已取消)")
+                continue
+
+            elif cmd == "/export":
+                if not session["messages"]:
+                    print("(当前会话还没有对话内容，不导出)")
+                    continue
+                path, overwritten = export_session(session, arg or None)
+                print(f"已导出到 {path}" + ("（已覆盖旧文件）" if overwritten else ""))
+
+            elif cmd == "/list":
+                sessions = list_sessions()
+                if not sessions:
+                    print("(还没有保存过任何会话)")
+                for name, data in sessions:
+                    n_msgs = len(data.get("messages", []))
+                    print(f"  - {name}  [{data.get('provider')}/{data.get('model')}]  "
+                          f"{n_msgs} 条消息  更新于 {data.get('updated_at')}")
+
+            elif cmd == "/new":
+                new_name = arg or default_session_name()
+                if session_path(new_name).exists():
+                    print(f"会话「{new_name}」已存在，请换个名字或用 /resume 恢复。")
+                    continue
+                save_session(session)
+                # base_url 一并带走：openai_responses 等 provider 没有它无法发起调用
+                session = new_session(new_name, provider, session["model"], session["system_prompt"],
+                                      base_url=session.get("base_url"),
+                                      web_search=session.get("web_search", False))
+                print(f"已开启新会话「{new_name}」")
+
+            elif cmd == "/system":
+                if arg:
+                    session["system_prompt"] = arg
+                    print("已更新 system prompt。")
+                else:
+                    print(f"当前 system prompt: {session['system_prompt'] or '(未设置)'}")
+
+            elif cmd == "/model":
+                if arg:
+                    session["model"] = arg
+                    print(f"已切换模型为: {arg}")
+                else:
+                    print(f"当前模型: {session['model']}")
+
+            elif cmd == "/baseurl":
+                if arg:
+                    session["base_url"] = arg
+                    print(f"已设置 base url 为: {arg}")
+                else:
+                    print(f"当前 base url: {session.get('base_url') or '(未设置，使用 provider 默认地址)'}")
+
+            elif cmd == "/web":
+                if provider != "openai_responses":
+                    print("联网搜索目前仅支持 openai_responses provider。")
+                elif not arg:
+                    enabled = session.get("web_search", False)
+                    print(f"当前联网搜索: {'on（模型自动决策）' if enabled else 'off'}")
+                elif arg.lower() in ("on", "off"):
+                    session["web_search"] = arg.lower() == "on"
+                    if session["web_search"]:
+                        print("已开启联网搜索，由模型自动决策。")
+                    else:
+                        print("已关闭联网搜索。")
+                else:
+                    print("用法: /web [on|off]")
+
+            elif cmd == "/history":
+                msgs = session["messages"]
+                if not msgs:
+                    print("(当前会话还没有对话内容)")
+                    continue
+                if arg:
+                    # /history N：只看最近 N 轮（一轮 = 一问一答两条消息）
+                    try:
+                        n = int(arg)
+                        if n <= 0:
+                            raise ValueError
+                    except ValueError:
+                        print("用法: /history [最近N轮]")
+                        continue
+                    msgs = msgs[-2 * n:]
+                    # 对齐到 user 边界，避免从半截对话开始显示
+                    while msgs and msgs[0]["role"] != "user":
+                        msgs = msgs[1:]
+                    if len(msgs) < len(session["messages"]):
+                        print(f"(仅显示最近 {n} 轮；完整历史共 {len(session['messages'])} 条消息，"
+                              f"/history 查看全部)")
+                _page_text(_format_history(msgs))
+
+            elif cmd == "/clear":
+                session["messages"] = []
+                save_session(session, force=True)  # 空历史也必须覆盖旧文件，避免恢复后旧消息重现
+                print("已清空当前会话历史。")
+
+            else:
+                print(f"未知命令: {cmd}，输入 /help 查看可用命令。")
+
+            continue
+
+        # 普通用户消息 -> 调用模型
+        send_message(session, user_input, provider, api_key)
+
+
+def send_message(session, user_input, provider, api_key):
+    """把一条用户消息（可含 @附件）发给模型；失败/中断时消息不入库。"""
+    if not api_key:
+        print(stylize(f"[错误] 当前 provider={provider} 没有可用 API Key，已取消发送。", "red"))
+        return
+    try:
+        message = _build_user_message(user_input, provider)
+    except (ValueError, OSError) as e:
+        print(stylize(f"[附件错误] {e}", "red"))
+        return
+    session["messages"].append(message)
+    for label in _attachment_labels(message):
+        print(stylize(f"[附件] {label}", "gray"))
+    base_url = session.get("base_url")
+    is_streaming = provider in STREAMING_PROVIDERS
+
+    # 等待期间显示转圈指示，首个正文 delta 到达即撤掉
+    indicator = ThinkingIndicator()
+    indicator.start()
+    try:
+        if is_streaming:
+            print(flush=True)
+            stream = StreamRenderer(on_output=indicator.stop)
+
+            def _on_delta(text):
+                stream.feed(text)
+
+            def _on_reasoning(_text):
+                indicator.set_state(random.choice(ThinkingIndicator._VERBS))
+
+            def _on_search(state):
+                if state == "completed":
+                    # 搜索完成后进入结果整理阶段；若再次搜索，会重新切回搜索提示。
+                    status = random.choice(ThinkingIndicator._VERBS)
+                else:
+                    status = {
+                        "in_progress": "搜索中",
+                        "searching": "搜索中",
+                        "failed": "搜索失败",
+                    }.get(state, "搜索中")
+                indicator.set_state(status, force=True)
+
+            reply = call_model(provider, session["messages"], session["system_prompt"],
+                                session["model"], api_key, base_url=base_url,
+                                on_delta=_on_delta, on_reasoning=_on_reasoning,
+                                web_search=session.get("web_search", False), on_search=_on_search)
+            stream.finish()
+            print()
+        else:
+            reply = call_model(provider, session["messages"], session["system_prompt"],
+                                session["model"], api_key, base_url=base_url)
+    except RuntimeError as e:
+        print(stylize(f"\n[出错了] {e}", "red"))
+        session["messages"].pop()  # 失败的消息不计入历史
+        return
+    except KeyboardInterrupt:
+        # 等待响应/流式输出中途按 Ctrl-C：取消本轮，消息不计入历史，回到输入
+        print(stylize("\n[已取消] 本轮请求已被中断", "gray"))
+        session["messages"].pop()
+        return
+    finally:
+        indicator.stop()
+
+    session["messages"].append({"role": "assistant", "content": reply})
+    if not is_streaming:
+        print()
+        print(render_markdown(reply))
+        print()
+
+    # 每轮自动保存，防止意外退出丢历史
+    save_session(session)
+
+
+_EDIT_HINT = ("# 在下方输入消息（可多行），保存并退出编辑器后发送。\n"
+              "# 这两行提示会被自动去掉；内容为空则不发送。\n")
+
+
+def _edit_in_editor():
+    """打开 $VISUAL/$EDITOR（默认 vi）编辑多行消息，返回消息文本；取消或为空返回 None。
+    走临时文件而不是终端行缓冲，所以没有单行 1024 字节之类的长度限制，
+    瓶颈只在下游的模型上下文窗口和 API 请求体大小。"""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    fd, path = tempfile.mkstemp(suffix=".md", prefix="frz-edit-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_EDIT_HINT)
+        try:
+            rc = subprocess.call(shlex.split(editor) + [path])
+        except FileNotFoundError:
+            print(f"[出错了] 找不到编辑器: {editor}（可用 export EDITOR=vim 指定）")
+            return None
+        if rc != 0:
+            print("(编辑器异常退出，已取消)")
+            return None
+        text = Path(path).read_text(encoding="utf-8")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    # 只去掉"未被用户动过"的提示行：不能用"忽略 # 开头行"的粗暴规则，
+    # 否则贴的日志里 root 提示符（# iptables -L）这类内容会被误删
+    if text.startswith(_EDIT_HINT):
+        text = text[len(_EDIT_HINT):]
+    return text.strip() or None
+
+
+# --------------------------------------------------------------------------
+# CLI 入口
+# --------------------------------------------------------------------------
+
+def resolve_model(provider, cli_model, cfg):
+    """模型名解析：--model > config 里按 provider 存的 model > 旧版全局 model > 内置默认。
+    旧版 config 的全局 "model" 字段只对 config 里的默认 provider 生效——否则切到
+    别的 provider 时会拿着上一个 provider 的模型名去调用（404）。"""
+    if cli_model:
+        return cli_model
+    models = cfg.get("models", {})
+    if provider in models:
+        return models[provider]
+    if provider == cfg.get("provider"):
+        return cfg.get("model") or DEFAULT_MODELS.get(provider)
+    return DEFAULT_MODELS.get(provider)
+
+
+def resolve_base_url(provider, cli_url, cfg):
+    if cli_url:
+        return cli_url
+    urls = cfg.get("base_urls", {})
+    if provider in urls:
+        return urls[provider]
+    return DEFAULT_BASE_URLS.get(provider)
+
+
+def resolve_api_key(provider, cli_key, cfg):
+    if cli_key:
+        return cli_key
+    env_name = ENV_KEY_NAMES.get(provider)
+    if env_name and os.environ.get(env_name):
+        return os.environ[env_name]
+    keys = cfg.get("api_keys", {})
+    if provider in keys:
+        return keys[provider]
+    return None
+
+
+def _resumed_api_key(previous_provider, new_provider, current_key):
+    """恢复会话时解析 Key；跨 provider 且无新 Key 时绝不复用旧 Key。"""
+    resumed_key = resolve_api_key(new_provider, None, load_config())
+    if resumed_key:
+        return resumed_key
+    if new_provider != previous_provider:
+        return None
+    # 同 provider 仍允许使用启动时通过 --api-key 传入、未写入配置的 Key。
+    return current_key
+
+
+# argparse 的 help 输出中文化。argparse 内部通过模块级 _() 做翻译（usage: / error 消息等），
+# 这里只替换 usage 前缀一个词，其余消息保持英文原样（出错信息不翻译，方便搜索）。
+argparse._ = lambda s: {"usage: ": "用法: "}.get(s, s)
+
+
+class FrzArgumentParser(argparse.ArgumentParser):
+    """统一中文化 argparse 帮助：-h 文案 + 分组标题（位置参数/选项）。
+    所有子 parser（add_parser 默认沿用父 parser 的类）自动获得同样行为。"""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("add_help", False)
+        super().__init__(*args, **kwargs)
+        self.add_argument("-h", "--help", action="help", default=argparse.SUPPRESS,
+                          help="显示本帮助信息并退出")
+        self._positionals.title = "位置参数"
+        self._optionals.title = "选项"
+
+    def format_help(self):
+        # 主帮助首行放"名称+版本+一句话定位"（子命令帮助不加）
+        text = super().format_help()
+        if self.prog == "frz":
+            text = (f"frz {__version__} — 一个类似 Gemini CLI 的多模型命令行聊天工具"
+                    f"（支持 Anthropic / OpenAI / Gemini / OpenAI Responses 协议后端）\n"
+                    f"作者: {__author__}\n\n") + text
+        return text
+
+
+EPILOG = f"""\
+示例：
+  frz                                       用默认配置直接开始聊天
+  frz --provider openai --model gpt-4o      指定 provider / 模型
+  frz --resume my-session                   恢复已保存的会话
+  frz --web                                 允许模型按需求自动联网搜索
+  frz --no-web                              新会话关闭联网搜索
+  frz --list-sessions                       列出所有已保存的会话
+  frz config set --provider anthropic --api-key sk-ant-xxxx
+                                            把默认配置写入 ~/.frz/config.json，以后免参数
+  frz rename old new                        重命名已保存的会话
+  frz clean                                 删除空会话及无引用附件
+
+API Key 优先级：--api-key > 环境变量 > config 文件
+  anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
+  gemini=GEMINI_API_KEY        openai_responses=ARK_API_KEY
+
+model 和 base url 按 provider 分别保存，切换 provider 互不影响。
+
+进入会话后输入 /help 查看斜杠命令（/save /resume /export /edit /history 等），
+输入时可用 Tab 补全斜杠命令和 /resume 的会话名。
+"""
+
+
+def build_arg_parser():
+    parser = FrzArgumentParser(
+        prog="frz",
+        # usage 显式换行：argparse 自动折行按字符数算缩进，对中文前缀"用法: "
+        # 会少算宽度导致续行对不齐，这里手工对齐（续行缩进 = "用法: frz " 的显示宽度）
+        usage="frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n"
+              "          [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]\n"
+              "          [--session-name NAME] [--list-sessions] {config,rename,clean} ...",
+        description="支持 Anthropic / OpenAI / Gemini / OpenAI Responses 协议四种后端",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="subcommand", title="子命令")
+
+    # config 子命令
+    config_p = sub.add_parser("config", help="查看或设置默认配置",
+                              description=f"查看或设置默认配置（保存于 {CONFIG_FILE}）")
+    config_sub = config_p.add_subparsers(dest="config_action", title="子命令")
+    set_p = config_sub.add_parser("set", help="设置默认 provider/model/api-key",
+                                  # 同主 parser：手工换行对齐（缩进 = "用法: frz config set " 宽度）
+                                  usage="frz config set [-h] [--provider PROVIDER] [--model MODEL]\n"
+                                        "                     [--api-key KEY] [--base-url URL]",
+                                  description="设置默认 provider/model/api-key"
+                                              "（API Key、base url、model 均按 provider 分别保存）")
+    set_p.add_argument("--provider", choices=list(CALLERS.keys()), metavar="PROVIDER",
+                       help=f"模型后端：{' / '.join(CALLERS)}")
+    set_p.add_argument("--model", metavar="MODEL", help="默认模型名称（按 provider 分别保存）")
+    set_p.add_argument("--api-key", metavar="KEY", help="对应 provider 的 API Key")
+    set_p.add_argument("--base-url", metavar="URL",
+                       help="自定义 API base url（openai_responses 等 provider 使用）")
+    config_sub.add_parser("show", help="显示当前配置", description="显示当前默认配置")
+
+    # rename 子命令：不进 REPL 直接重命名已保存的会话
+    rename_p = sub.add_parser("rename", help="重命名已保存的会话",
+                              description=f"重命名 {SESS_DIR} 下已保存的会话")
+    rename_p.add_argument("old_name", help="原会话名")
+    rename_p.add_argument("new_name", help="新会话名")
+
+    # clean 子命令：删除空会话，以及超过保护期且不被任何会话引用的附件
+    sub.add_parser("clean", help="删除空会话及无引用附件",
+                   description="删除 0 条消息的空会话，并清理超过 24 小时且不被任何会话引用的附件快照")
+
+    # 默认聊天参数（不加子命令时直接进入聊天）
+    parser.add_argument("--provider", choices=list(CALLERS.keys()), metavar="PROVIDER",
+                        help=f"使用的模型后端：{' / '.join(CALLERS)}（默认 anthropic）")
+    parser.add_argument("--model", metavar="MODEL",
+                        help="模型名称，例如 claude-sonnet-4-6 / gpt-4o / gemini-2.5-flash / kimi-k3")
+    parser.add_argument("--api-key", metavar="KEY",
+                        help="API Key（也可用环境变量或 config 提供，见下方说明）")
+    parser.add_argument("--base-url", metavar="URL",
+                        help="自定义 API base url（openai_responses 等 provider 需要，比如火山方舟地址）")
+    parser.add_argument("--system", metavar="PROMPT", help="system prompt")
+    web_group = parser.add_mutually_exclusive_group()
+    web_group.add_argument("--web", dest="web_search", action="store_true",
+                           help="允许 openai_responses 模型按需求自动联网搜索")
+    web_group.add_argument("--no-web", dest="web_search", action="store_false",
+                           help="关闭联网搜索")
+    parser.set_defaults(web_search=None)
+    parser.add_argument("--resume", metavar="NAME", help="恢复指定名字的会话")
+    parser.add_argument("--session-name", metavar="NAME", help="新会话的名字（不指定则自动生成）")
+    parser.add_argument("--list-sessions", action="store_true", help="列出所有已保存的会话后退出")
+    parser.add_argument("--version", action="version",
+                        version=f"frz {__version__} {_PLAT}  by {__author__}")
+
+    return parser
+
+
+def main():
+    ensure_dirs()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    cfg = load_config()
+
+    if args.subcommand == "config":
+        if args.config_action == "set":
+            if args.provider:
+                cfg["provider"] = args.provider
+            if args.model:
+                cfg.setdefault("models", {})[args.provider or cfg.get("provider", "anthropic")] = args.model
+            if args.api_key:
+                cfg.setdefault("api_keys", {})[args.provider or cfg.get("provider", "anthropic")] = args.api_key
+            if args.base_url:
+                cfg.setdefault("base_urls", {})[args.provider or cfg.get("provider", "anthropic")] = args.base_url
+            save_config(cfg)
+            print(f"配置已保存到 {CONFIG_FILE}")
+        else:
+            print(json.dumps(cfg, ensure_ascii=False, indent=2))
+        return
+
+    if args.subcommand == "rename":
+        ok, result = rename_session_file(args.old_name, args.new_name)
+        if ok:
+            print(f"已将会话「{args.old_name}」重命名为「{args.new_name}」({result})")
+        else:
+            print(f"[错误] {result}")
+            sys.exit(1)
+        return
+
+    if args.subcommand == "clean":
+        removed = [name for name, data in list_sessions() if not data.get("messages")]
+        for name in removed:
+            session_path(name).unlink()
+            print(f"已删除空会话: {name}")
+        if not removed:
+            print("(没有空会话)")
+        try:
+            freed, count, skipped = _clean_unreferenced_attachments()
+        except RuntimeError as e:
+            print(stylize(f"[注意] {e}", "red"))
+            return
+        if count:
+            print(f"已清理 {count} 个无引用附件，释放 {_format_size(freed)}")
+        if skipped:
+            print(f"(保留 {skipped} 个 24 小时内的无引用附件)")
+        if not count and not skipped:
+            print("(没有可清理的无引用附件)")
+        return
+
+    if args.list_sessions:
+        sessions = list_sessions()
+        if not sessions:
+            print("(还没有保存过任何会话)")
+        for name, data in sessions:
+            n_msgs = len(data.get("messages", []))
+            print(f"  - {name}  [{data.get('provider')}/{data.get('model')}]  "
+                  f"{n_msgs} 条消息  更新于 {data.get('updated_at')}")
+        return
+
+    provider = args.provider or cfg.get("provider", "anthropic")
+
+    session = None
+    if args.resume:
+        session = load_session(args.resume)
+        if session is None:
+            print(f"[错误] 找不到会话「{args.resume}」，用 --list-sessions 查看已有会话。")
+            sys.exit(1)
+        # repl 始终按会话自己的 provider 调用模型，所以 provider/key 也以会话为准，
+        # 避免 config 默认 provider 与会话不一致时拿错 key（401）
+        provider = session["provider"]
+
+    model = resolve_model(provider, args.model, cfg)
+    base_url = resolve_base_url(provider, args.base_url, cfg)
+    api_key = resolve_api_key(provider, args.api_key, cfg)
+
+    if not api_key:
+        env_name = ENV_KEY_NAMES.get(provider, "对应的环境变量")
+        print(f"[错误] 找不到 {provider} 的 API Key。请用以下任意方式提供：")
+        print(f"  1) --api-key 你的密钥")
+        print(f"  2) export {env_name}=你的密钥")
+        print(f"  3) frz config set --provider {provider} --api-key 你的密钥")
+        sys.exit(1)
+
+    if provider in DEFAULT_BASE_URLS and not base_url:
+        print(f"[错误] provider={provider} 需要 base_url，请用 --base-url 指定，"
+              f"或 frz config set --provider {provider} --base-url 地址")
+        sys.exit(1)
+
+    if session is not None:
+        # --resume：应用命令行覆盖项
+        if args.system:
+            session["system_prompt"] = args.system
+        if args.model:
+            session["model"] = args.model
+        if args.base_url:
+            session["base_url"] = args.base_url
+        elif "base_url" not in session:
+            session["base_url"] = base_url
+        if args.web_search is not None:
+            session["web_search"] = args.web_search
+    else:
+        name = args.session_name or default_session_name()
+        if session_path(name).exists():
+            print(f"[错误] 会话「{name}」已存在；请换用 --session-name，或用 --resume 恢复。")
+            sys.exit(1)
+        session = new_session(name, provider, model, args.system or "", base_url=base_url,
+                              web_search=args.web_search)
+
+    repl(session, api_key)
+
+
+if __name__ == "__main__":
+    main()

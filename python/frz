@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.9"
-# dependencies = [
-#   "pygments",
-#   "gnureadline; sys_platform == 'darwin'",
-# ]
-# ///
 """
 frz - a Gemini-CLI-style multi-provider chat client for the terminal.
 
@@ -15,15 +8,21 @@ Features:
   - Pure standard library (urllib); no third-party dependency required
   - Terminal Markdown rendering (headings/bold/lists/tables/code blocks);
     install pygments for syntax highlighting in code blocks
-  - Hand-drawn ASCII box diagrams (┌─┐ │ └─┘) in code blocks are automatically
+  - Hand-drawn ASCII box diagrams in code blocks are automatically
     realigned, fixing ragged right edges caused by the model miscounting CJK width
   - Sessions can be saved / resumed / listed / exported to Markdown,
     stored in ~/.frz/sessions/*.json
   - REPL slash commands: /help /save /rename /resume /list /new /export /edit
-    /system /model /baseurl /history /clear /exit
-  - REPL input comforts: Tab completion (commands & session names), /edit for
-    multi-line input in $EDITOR, /history with automatic paging,
+    /system /model /baseurl /web /history /clear /exit
+  - REPL input comforts: Tab completion (commands, session names and @paths),
+    /edit for multi-line input in $EDITOR, /history with automatic paging,
     /resume without a name resumes the most recent session
+  - Local commands: !command and bare ls / pwd / cd; output stays out of model context
+  - openai_responses @text/@image attachments using filenames, relative or absolute paths;
+    2 MiB text / 10 MiB image / 15 MiB total limits; content-addressed snapshots
+  - Web search is enabled by default for new Responses sessions and controlled by
+    /web on|off or --web/--no-web; search status is shown while waiting
+  - Atomic owner-only session writes, legacy attachment migration and safe cleanup
 
 Usage examples:
   # Start a new session (defaults to Anthropic claude-sonnet-4-6)
@@ -54,10 +53,13 @@ Usage examples:
       --model kimi-k3 --base-url https://ark.cn-beijing.volces.com/api/v3 --api-key ark-xxxx
 """
 
-__version__ = "1.0.0"
+__version__ = "1.5.1"
 __author__ = "Frank Zhu <flankeroot@gmail.com>"
 
 import argparse
+import base64
+import hashlib
+import http.client
 import json
 import os
 import platform as _platform
@@ -79,6 +81,7 @@ _PLAT = f"{_platform.system().lower()}/{_platform.machine()}"  # e.g. darwin/arm
 
 APP_DIR = Path.home() / ".frz"
 SESS_DIR = APP_DIR / "sessions"
+ATTACH_DIR = APP_DIR / "attachments"
 EXPORT_DIR = APP_DIR / "exports"
 CONFIG_FILE = APP_DIR / "config.json"
 
@@ -110,6 +113,14 @@ DEFAULT_BASE_URLS = {
 # Providers with true typewriter streaming (print as generated, not after full reply)
 STREAMING_PROVIDERS = {"openai_responses"}
 
+# Attachment limits. Oversized files are rejected, never silently truncated.
+MAX_ATTACHMENTS = 8
+MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024
+# Grace period protects blobs just written by another running frz process.
+ATTACHMENT_CLEAN_GRACE_SECONDS = 24 * 60 * 60
+
 
 # --------------------------------------------------------------------------
 # Basic utilities
@@ -117,6 +128,38 @@ STREAMING_PROVIDERS = {"openai_responses"}
 
 def ensure_dirs():
     SESS_DIR.mkdir(parents=True, exist_ok=True)
+    ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+    for directory in (SESS_DIR, ATTACH_DIR):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    # Tighten permissions on sessions created by earlier versions.
+    for path in SESS_DIR.glob("*.json"):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _write_json_atomic(path, data):
+    """Write JSON atomically with owner-only permissions, preserving the old file on failure."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(data, ensure_ascii=False, indent=2)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
 
 
 def load_config():
@@ -130,11 +173,7 @@ def load_config():
 
 def save_config(cfg):
     ensure_dirs()
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        os.chmod(CONFIG_FILE, 0o600)
-    except OSError:
-        pass
+    _write_json_atomic(CONFIG_FILE, cfg)
 
 
 def session_path(name):
@@ -154,6 +193,125 @@ def list_sessions():
     return sessions
 
 
+def _attachment_blob_path(digest):
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise RuntimeError("invalid attachment SHA-256 in session")
+    return ATTACH_DIR / digest
+
+
+def _store_attachment(data):
+    """Atomically store a blob by content hash and reuse identical content."""
+    ensure_dirs()
+    digest = hashlib.sha256(data).hexdigest()
+    path = ATTACH_DIR / digest
+    if path.is_file():
+        try:
+            if hashlib.sha256(path.read_bytes()).hexdigest() == digest:
+                os.utime(path, None)
+                return digest
+        except OSError:
+            pass
+    fd, temp_name = tempfile.mkstemp(prefix=".frz-attachment-", dir=ATTACH_DIR)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+    return digest
+
+
+def _attachment_bytes(attachment):
+    """Read an external snapshot, with backward compatibility for inline content/data."""
+    digest = attachment.get("sha256")
+    if digest:
+        path = _attachment_blob_path(digest)
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            raise RuntimeError(
+                f"attachment snapshot missing or unreadable: {attachment.get('name', '?')} ({digest[:12]})"
+            ) from e
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError(f"attachment checksum failed: {attachment.get('name', '?')} ({digest[:12]})")
+        return data
+    kind = attachment.get("kind")
+    if kind == "image" and attachment.get("data"):
+        try:
+            return base64.b64decode(attachment["data"], validate=True)
+        except (ValueError, TypeError) as e:
+            raise RuntimeError(f"invalid legacy image Base64: {attachment.get('name', '?')}") from e
+    if kind == "text" and attachment.get("content") is not None:
+        return attachment["content"].encode("utf-8")
+    raise RuntimeError(f"incomplete attachment data: {attachment.get('name', '?')}")
+
+
+def _attachment_text(attachment):
+    try:
+        return _attachment_bytes(attachment).decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"text attachment is not valid UTF-8: {attachment.get('name', '?')}") from e
+
+
+def _externalize_session_attachments(session):
+    """Migrate inline attachments before saving so JSON contains only blob references."""
+    for message in session.get("messages", []):
+        for attachment in message.get("attachments", []):
+            if attachment.get("sha256"):
+                continue
+            data = _attachment_bytes(attachment)
+            attachment["sha256"] = _store_attachment(data)
+            attachment["size"] = len(data)
+            attachment.pop("content", None)
+            attachment.pop("data", None)
+
+
+def _referenced_attachment_hashes():
+    """Collect all references; abort cleanup if any session cannot be parsed."""
+    references = set()
+    for path in SESS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(f"cannot parse session {path.name}; attachment cleanup skipped") from e
+        for message in data.get("messages", []):
+            for attachment in message.get("attachments", []):
+                digest = attachment.get("sha256")
+                if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                    references.add(digest)
+    return references
+
+
+def _clean_unreferenced_attachments(max_age=ATTACHMENT_CLEAN_GRACE_SECONDS):
+    """Delete old unreferenced blobs; return (bytes removed, count removed, count skipped)."""
+    ensure_dirs()
+    references = _referenced_attachment_hashes()
+    now = time.time()
+    removed_bytes = removed_count = skipped = 0
+    for path in ATTACH_DIR.iterdir():
+        if not re.fullmatch(r"[0-9a-f]{64}", path.name) or path.name in references:
+            continue
+        try:
+            if not path.is_file():
+                continue
+            if now - path.stat().st_mtime < max_age:
+                skipped += 1
+                continue
+            size = path.stat().st_size
+            path.unlink()
+            removed_bytes += size
+            removed_count += 1
+        except FileNotFoundError:
+            pass
+    return removed_bytes, removed_count, skipped
+
+
 def save_session(session, force=False):
     """Save the session; returns the path, or None if skipped.
     Empty sessions (0 messages) are skipped unless force=True, so the automatic
@@ -162,9 +320,10 @@ def save_session(session, force=False):
     if not force and not session.get("messages"):
         return None
     ensure_dirs()
+    _externalize_session_attachments(session)
     session["updated_at"] = datetime.now().isoformat(timespec="seconds")
     path = session_path(session["name"])
-    path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(path, session)
     return path
 
 
@@ -184,7 +343,7 @@ def rename_session_file(old_name, new_name):
     data = json.loads(old_path.read_text(encoding="utf-8"))
     data["name"] = new_name
     data["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    new_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(new_path, data)
     if new_path != old_path:
         old_path.unlink()
     return True, new_path
@@ -197,13 +356,16 @@ def load_session(name):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def new_session(name, provider, model, system_prompt, base_url=None):
+def new_session(name, provider, model, system_prompt, base_url=None, web_search=None):
+    if web_search is None:
+        web_search = provider == "openai_responses"
     return {
         "name": name,
         "provider": provider,
         "model": model,
         "base_url": base_url,  # only used by some providers (e.g. openai_responses)
         "system_prompt": system_prompt,
+        "web_search": bool(web_search),  # Allow the model to decide when to search
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "messages": [],  # [{role: "user"|"assistant", content: str}]
@@ -221,6 +383,8 @@ def export_session(session, dest=None):
         lines.append(f"> system: {session['system_prompt']}")
     for m in session["messages"]:
         lines += ["", f"## {'User' if m['role'] == 'user' else 'Assistant'}", "", m["content"]]
+        for label in _attachment_labels(m):
+            lines += ["", f"> Attachment: {label}"]
 
     path = Path(dest).expanduser() if dest else EXPORT_DIR / f"{session['name']}.md"
     if not path.suffix:
@@ -229,6 +393,140 @@ def export_session(session, dest=None):
     overwritten = path.exists()
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path, overwritten
+
+
+# --------------------------------------------------------------------------
+# @ local file/image attachments
+# --------------------------------------------------------------------------
+
+def _parse_at_references(text):
+    """Return (text without @ references, paths). Supports quoted paths and @@ escapes."""
+    out, refs = [], []
+    i = 0
+    while i < len(text):
+        if text[i] != "@" or (i > 0 and not text[i - 1].isspace()):
+            out.append(text[i])
+            i += 1
+            continue
+        if i + 1 < len(text) and text[i + 1] == "@":
+            out.append("@")
+            i += 2
+            continue
+        i += 1
+        if i >= len(text):
+            out.append("@")
+            break
+        if text[i] in ('"', "'"):
+            quote = text[i]
+            i += 1
+            chars = []
+            closed = False
+            while i < len(text):
+                c = text[i]
+                if c == "\\" and i + 1 < len(text) and text[i + 1] in (quote, "\\"):
+                    chars.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    closed = True
+                    i += 1
+                    break
+                chars.append(c)
+                i += 1
+            if not closed:
+                raise ValueError("unterminated quote in @ attachment path")
+            path = "".join(chars)
+            if i < len(text) and not text[i].isspace():
+                raise ValueError("quoted @ attachment paths must be followed by whitespace")
+        else:
+            start = i
+            while i < len(text) and not text[i].isspace():
+                i += 1
+            path = text[start:i]
+        if not path:
+            out.append("@")
+        else:
+            refs.append(path)
+    return "".join(out).strip(), refs
+
+
+def _image_media_type(data):
+    """Detect common image formats by signature rather than extension."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _load_attachment(reference, total_bytes):
+    path = Path(reference).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    if not path.is_file():
+        raise ValueError(f"attachment does not exist or is not a regular file: {reference}")
+    size = path.stat().st_size
+    if total_bytes + size > MAX_TOTAL_ATTACHMENT_BYTES:
+        raise ValueError(f"attachments exceed the {MAX_TOTAL_ATTACHMENT_BYTES // 1024 // 1024} MiB total limit: {path.name}")
+    data = path.read_bytes()
+    media_type = _image_media_type(data)
+    base = {"name": path.name, "path": str(path), "size": size}
+    if media_type:
+        if size > MAX_IMAGE_ATTACHMENT_BYTES:
+            raise ValueError(f"image exceeds the {MAX_IMAGE_ATTACHMENT_BYTES // 1024 // 1024} MiB limit: {path.name}")
+        return {**base, "kind": "image", "media_type": media_type,
+                "sha256": _store_attachment(data)}, size
+    if size > MAX_TEXT_ATTACHMENT_BYTES:
+        raise ValueError(f"text attachment exceeds the {MAX_TEXT_ATTACHMENT_BYTES // 1024 // 1024} MiB limit: {path.name}")
+    if b"\x00" in data:
+        raise ValueError(f"unsupported binary file (UTF-8 text and common images only): {path.name}")
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"text attachment must be UTF-8: {path.name}") from e
+    return {**base, "kind": "text", "sha256": _store_attachment(data)}, size
+
+
+def _build_user_message(user_input, provider):
+    """Build a user message with immutable attachment snapshots."""
+    text, references = _parse_at_references(user_input)
+    if references and provider != "openai_responses":
+        raise ValueError("@ attachments currently require the openai_responses provider")
+    if len(references) > MAX_ATTACHMENTS:
+        raise ValueError(f"at most {MAX_ATTACHMENTS} attachments are allowed per message")
+    attachments = []
+    total_bytes = 0
+    for ref in references:
+        attachment, size = _load_attachment(ref, total_bytes)
+        attachments.append(attachment)
+        total_bytes += size
+    if not text and attachments:
+        text = "Please analyze the attachment(s)."
+    message = {"role": "user", "content": text}
+    if attachments:
+        message["attachments"] = attachments
+    return message
+
+
+def _format_size(size):
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def _attachment_labels(message):
+    labels = []
+    for a in message.get("attachments", []):
+        kind = "image" if a.get("kind") == "image" else "text"
+        labels.append(f"{a.get('name', '?')} ({kind}, {_format_size(a.get('size', 0))})")
+    return labels
 
 
 # --------------------------------------------------------------------------
@@ -247,6 +545,8 @@ def _http_post_json(url, headers, payload, timeout=300):
         raise RuntimeError(f"HTTP {e.code}: {body}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"network error: {e.reason}") from e
+    except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        raise RuntimeError(f"failed to read response: {e}") from e
 
 
 def call_anthropic(messages, system, model, api_key, max_tokens=8192, base_url=None, on_delta=None, on_reasoning=None):
@@ -306,7 +606,39 @@ def call_gemini(messages, system, model, api_key, max_tokens=8192, base_url=None
     return "".join(p.get("text", "") for p in parts)
 
 
-def call_openai_responses(messages, system, model, api_key, max_tokens=8192, base_url=None, on_delta=None, on_reasoning=None):
+def _responses_content(message):
+    """Convert an internal message into Responses API text/image content parts."""
+    attachments = message.get("attachments", [])
+    text_sections = [message.get("content", "")]
+    for a in attachments:
+        if a.get("kind") != "text":
+            continue
+        name = json.dumps(a.get("name", "attachment"), ensure_ascii=False)
+        path = json.dumps(a.get("path", ""), ensure_ascii=False)
+        text_sections.append(
+            f"\n\n<attached_file name={name} path={path}>\n"
+            f"{_attachment_text(a)}\n</attached_file>"
+        )
+    parts = []
+    text = "".join(text_sections)
+    if text or not attachments:
+        parts.append({"type": "input_text", "text": text})
+    for a in attachments:
+        kind = a.get("kind")
+        if kind == "text":
+            continue
+        if kind != "image":
+            raise RuntimeError(f"unknown attachment type: {kind}")
+        media_type = a.get("media_type")
+        if not media_type:
+            raise RuntimeError(f"image attachment has no MIME type: {a.get('name', '?')}")
+        data = base64.b64encode(_attachment_bytes(a)).decode("ascii")
+        parts.append({"type": "input_image", "image_url": f"data:{media_type};base64,{data}"})
+    return parts
+
+
+def call_openai_responses(messages, system, model, api_key, max_tokens=8192, base_url=None,
+                          on_delta=None, on_reasoning=None, web_search=False, on_search=None):
     """
     Speaks the OpenAI Responses API protocol (POST {base_url}/responses), SSE streaming.
     Protocol shape adapted from Open WebUI's Pipe function:
@@ -329,10 +661,13 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
     }
 
     input_items = [
-        {"role": m["role"], "content": [{"type": "input_text", "text": m["content"]}]}
+        {"role": m["role"], "content": _responses_content(m)}
         for m in messages
     ]
     payload = {"model": model, "input": input_items, "stream": True}
+    if web_search:
+        # Tool declaration only: the model decides whether a search is needed.
+        payload["tools"] = [{"type": "web_search"}]
     if system:
         payload["instructions"] = system
 
@@ -341,6 +676,7 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
     full_text = []
     current_event = None
+    completed = False
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             for raw_line in resp:
@@ -356,6 +692,8 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
                     continue
 
                 data_str = line[len("data:"):].strip()
+                event_for_data = current_event
+                current_event = None
                 if not data_str or data_str == "[DONE]":
                     continue
 
@@ -364,7 +702,7 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
                 except json.JSONDecodeError:
                     continue
 
-                etype = current_event or evt.get("type")
+                etype = evt.get("type") or event_for_data
 
                 if etype == "response.output_text.delta":
                     delta_text = evt.get("delta", "")
@@ -379,11 +717,25 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
                     if on_reasoning:
                         on_reasoning(evt.get("delta", ""))
 
-                elif etype == "response.failed":
-                    err = evt.get("response", {}).get("error", {}).get("message", "unknown error")
+                elif etype and etype.startswith("response.web_search_call."):
+                    if on_search:
+                        on_search(etype.rsplit(".", 1)[-1])
+
+                elif etype in ("error", "response.failed"):
+                    response = evt.get("response", {})
+                    err = response.get("error", {}).get("message")
+                    if not err:
+                        err = evt.get("error", {}).get("message", "unknown error")
                     raise RuntimeError(f"upstream error: {err}")
 
+                elif etype == "response.incomplete":
+                    response = evt.get("response", {})
+                    details = response.get("status_details") or {}
+                    reason = details.get("reason") or response.get("status") or "unknown reason"
+                    raise RuntimeError(f"incomplete upstream response: {reason}")
+
                 elif etype == "response.completed":
+                    completed = True
                     break
 
     except urllib.error.HTTPError as e:
@@ -391,7 +743,11 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
         raise RuntimeError(f"HTTP {e.code}: {body}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"network error: {e.reason}") from e
+    except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        raise RuntimeError(f"failed to read response stream: {e}") from e
 
+    if not completed:
+        raise RuntimeError("stream ended before response.completed; partial answer discarded")
     return "".join(full_text)
 
 
@@ -403,11 +759,14 @@ CALLERS = {
 }
 
 
-def call_model(provider, messages, system, model, api_key, base_url=None, on_delta=None, on_reasoning=None):
+def call_model(provider, messages, system, model, api_key, base_url=None, on_delta=None,
+               on_reasoning=None, web_search=False, on_search=None):
     if provider not in CALLERS:
         raise ValueError(f"unknown provider: {provider}")
-    return CALLERS[provider](messages, system, model, api_key, base_url=base_url,
-                             on_delta=on_delta, on_reasoning=on_reasoning)
+    kwargs = {"base_url": base_url, "on_delta": on_delta, "on_reasoning": on_reasoning}
+    if provider == "openai_responses":
+        kwargs.update({"web_search": web_search, "on_search": on_search})
+    return CALLERS[provider](messages, system, model, api_key, **kwargs)
 
 
 # --------------------------------------------------------------------------
@@ -993,9 +1352,10 @@ class StreamRenderer:
     (Markdown syntax closes per line), balancing real-timeness with correctness —
     markers split across deltas (e.g. `**bo` + `ld**`) are still handled correctly."""
 
-    def __init__(self):
+    def __init__(self, on_output=None):
         self._renderer = MarkdownRenderer()
         self._buf = ""
+        self._on_output = on_output
 
     def feed(self, text):
         self._buf += text
@@ -1009,12 +1369,19 @@ class StreamRenderer:
             self._buf = ""
         tail = self._renderer.flush()
         if tail is not None:
-            print(tail, flush=True)
+            self._print(tail)
+
+    def _print(self, text):
+        if self._on_output:
+            callback = self._on_output
+            self._on_output = None
+            callback()
+        print(text, flush=True)
 
     def _emit(self, line):
         rendered = self._renderer.feed_line(line)
         if rendered is not None:
-            print(rendered, flush=True)
+            self._print(rendered)
 
 
 class ThinkingIndicator:
@@ -1022,12 +1389,12 @@ class ThinkingIndicator:
     doesn't block network reads). Style replicates Claude Code's spinner:
     ✻ asterisk + random verb + shimmer sweep (base blue rgb(147,165,255), hot
     spot rgb(177,195,255), from its theme palette). stop() is called on the first
-    text delta or when the request ends, erasing the indicator line."""
+    visible rendered output or when the request ends, erasing the indicator line."""
 
     _GLYPH = "✻"
     # Random "cute verbs" picked on reasoning deltas (cf. Claude Code's Vibing/Pondering)
     _VERBS = ["Thinking", "Pondering", "Mulling", "Brewing", "Wondering",
-              "Deliberating", "Computing", "Searching", "Weaving", "Wandering"]
+              "Deliberating", "Computing", "Analyzing", "Weaving", "Wandering"]
     _BASE = "\033[38;2;147;165;255m"    # claudeBlue_FOR_SYSTEM_SPINNER
     _HOT = "\033[38;2;177;195;255m"     # claudeBlueShimmer_FOR_SYSTEM_SPINNER
     _RESET = "\033[0m"
@@ -1046,9 +1413,9 @@ class ThinkingIndicator:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def set_state(self, state):
-        # Switch from "Waiting" to a random thinking verb on the first reasoning delta
-        if self._state == "Waiting":
+    def set_state(self, state, force=False):
+        # Search events may override the initial thinking state.
+        if force or self._state == "Waiting":
             self._state = state
 
     def _shimmer(self, text, frame):
@@ -1088,6 +1455,54 @@ class ThinkingIndicator:
 # REPL
 # --------------------------------------------------------------------------
 
+def _change_directory(target=None):
+    """cd is the only shell builtin whose state persists across commands."""
+    path = Path(target).expanduser() if target else Path.home()
+    try:
+        os.chdir(path)
+        print(os.getcwd())
+    except OSError as e:
+        print(stylize(f"cd: {e}", "red"))
+
+
+def _run_shell_command(command):
+    """Run an explicit local command; output is never added to model context."""
+    print(stylize(f"$ {command}", "gray"), flush=True)
+    try:
+        result = subprocess.run(command, shell=True, executable="/bin/sh")
+        if result.returncode != 0:
+            print(stylize(f"[exit status: {result.returncode}]", "gray"))
+    except KeyboardInterrupt:
+        print("\n(command interrupted)")
+    except OSError as e:
+        print(stylize(f"command failed: {e}", "red"))
+
+
+def _handle_shell_input(user_input):
+    """Handle !command and bare ls/pwd/cd; leave all other input for the model."""
+    explicit = user_input.startswith("!")
+    command = user_input[1:].strip() if explicit else user_input
+    if explicit and not command:
+        print("usage: !<command>, e.g. !ls -la (a lone ! does not enter a persistent shell)")
+        return True
+    if not explicit:
+        first = command.split(None, 1)[0].lower()
+        if first not in ("ls", "pwd", "cd"):
+            return False
+    try:
+        parts = shlex.split(command)
+    except ValueError as e:
+        print(stylize(f"cannot parse command: {e}", "red"))
+        return True
+    if not parts:
+        return True
+    if parts[0] == "cd" and len(parts) <= 2:
+        _change_directory(parts[1] if len(parts) == 2 else None)
+    else:
+        _run_shell_command(command)
+    return True
+
+
 def _format_history(messages):
     """Format the message list into the text shown by /history."""
     out = []
@@ -1096,6 +1511,8 @@ def _format_history(messages):
         if m["role"] == "user":
             for line in m["content"].split("\n"):
                 out.append(stylize("> ", "green") + line)
+            for label in _attachment_labels(m):
+                out.append(stylize("> ", "green") + f"[Attachment: {label}]")
         else:
             out.append(render_markdown(m["content"]))
     return "\n".join(out)
@@ -1121,13 +1538,48 @@ def _page_text(text):
 # Slash commands offered for Tab completion (sorted for a readable completion menu)
 _REPL_COMMANDS = sorted([
     "/help", "/save", "/rename", "/resume", "/list", "/new", "/export", "/edit",
-    "/system", "/model", "/baseurl", "/history", "/clear", "/exit", "/quit",
+    "/system", "/model", "/baseurl", "/web", "/history", "/clear", "/exit", "/quit",
 ])
 
 
+def _path_completion_matches(text):
+    """Complete @ paths, quoting spaces and allowing directory traversal."""
+    raw = text[1:]
+    quote = raw[0] if raw[:1] in ('"', "'") else ""
+    if quote:
+        raw = raw[1:]
+    directory, base = os.path.split(raw)
+    read_dir = os.path.expanduser(directory or ".")
+    try:
+        entries = list(os.scandir(read_dir))
+    except OSError:
+        return []
+    matches = []
+    for entry in sorted(entries, key=lambda e: e.name):
+        if not base and entry.name.startswith("."):
+            continue
+        if not entry.name.startswith(base):
+            continue
+        candidate = os.path.join(directory, entry.name) if directory else entry.name
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            is_dir = False
+        if is_dir:
+            candidate += os.sep
+        needs_quote = any(c.isspace() for c in candidate)
+        active_quote = quote or ("'" if needs_quote else "")
+        closing_quote = active_quote if active_quote and not is_dir else ""
+        matches.append("@" + active_quote + candidate + closing_quote)
+        if len(matches) >= 100:
+            break
+    return matches
+
+
 def _completion_matches(buf, text):
-    """Tab completion candidates: session names after /resume; command names
-    while typing a command at line start."""
+    """Complete session names, slash commands, and @ paths."""
+    if text.startswith("@"):
+        return _path_completion_matches(text)
     if buf.startswith("/resume ") or buf.startswith("/resume\t"):
         return [name for name, _ in list_sessions() if name.startswith(text)]
     if buf.startswith("/") and " " not in buf:
@@ -1151,6 +1603,13 @@ Available commands:
     /model [name]        View or switch model
     /baseurl [url]       View or set custom API base url (required by
                          openai_responses and similar providers)
+    /web [on|off]        View or control web search; new Responses sessions
+                         default to on and the model decides when to search
+
+  Local commands & attachments (openai_responses)
+    !<command>           Run a local command, e.g. !ls -la; output stays local
+    ls / pwd / cd        Also available without !; cd persists the working directory
+    @<file>              Attach text or images; multiple files and Tab completion supported
 
   Other
     /edit                Compose a multi-line message in your editor (great for
@@ -1164,30 +1623,46 @@ Available commands:
 
 
 def send_message(session, user_input, provider, api_key):
-    """Send one user message to the model and render the reply;
-    on failure/interruption the message is not recorded."""
-    session["messages"].append({"role": "user", "content": user_input})
+    """Send one user message with optional @ attachments; failed rounds are not recorded."""
+    if not api_key:
+        print(stylize(f"[error] no API key available for provider={provider}; request cancelled", "red"))
+        return
+    try:
+        message = _build_user_message(user_input, provider)
+    except (ValueError, OSError) as e:
+        print(stylize(f"[attachment error] {e}", "red"))
+        return
+    session["messages"].append(message)
+    for label in _attachment_labels(message):
+        print(stylize(f"[attachment] {label}", "gray"))
     base_url = session.get("base_url")
     is_streaming = provider in STREAMING_PROVIDERS
 
-    # Spinner while waiting; dismissed on the first text delta
+    # Spinner while waiting; dismissed on the first visible rendered output
     indicator = ThinkingIndicator()
     indicator.start()
     try:
         if is_streaming:
             print(flush=True)
-            stream = StreamRenderer()
+            stream = StreamRenderer(on_output=indicator.stop)
 
             def _on_delta(text):
-                indicator.stop()
                 stream.feed(text)
 
             def _on_reasoning(_text):
                 indicator.set_state(random.choice(ThinkingIndicator._VERBS))
 
+            def _on_search(state):
+                if state == "completed":
+                    status = random.choice(ThinkingIndicator._VERBS)
+                else:
+                    status = "Search failed" if state == "failed" else "Searching"
+                indicator.set_state(status, force=True)
+
             reply = call_model(provider, session["messages"], session["system_prompt"],
                                 session["model"], api_key, base_url=base_url,
-                                on_delta=_on_delta, on_reasoning=_on_reasoning)
+                                on_delta=_on_delta, on_reasoning=_on_reasoning,
+                                web_search=session.get("web_search", False), on_search=_on_search)
             stream.finish()
             print()
         else:
@@ -1319,6 +1794,9 @@ def repl(session, api_key):
         if not user_input:
             continue
 
+        if _handle_shell_input(user_input):
+            continue
+
         if user_input.startswith("/"):
             parts = user_input.split(maxsplit=1)
             cmd = parts[0].lower()
@@ -1347,6 +1825,14 @@ def repl(session, api_key):
                     print("usage: /rename <new-name>")
                     continue
                 old_name = session["name"]
+                old_path = session_path(old_name)
+                if not old_path.exists() and not session.get("messages"):
+                    if session_path(arg).exists():
+                        print(f'session "{arg}" already exists, pick another name')
+                    else:
+                        session["name"] = arg
+                        print(f'renamed session "{old_name}" to "{arg}"')
+                    continue
                 save_session(session)  # persist latest content first, then rename as a whole
                 ok, result = rename_session_file(old_name, arg)
                 if ok:
@@ -1372,18 +1858,15 @@ def repl(session, api_key):
                 if loaded is None:
                     print(f'session "{target}" not found; type /list to see saved sessions.')
                     continue
+                previous_provider = provider
                 session = loaded
                 provider = session["provider"]
-                # The resumed session may belong to another provider, and the key
-                # resolved at startup may not apply; re-resolve against the
-                # session's own provider to avoid a 401 from using the wrong key
-                resumed_key = resolve_api_key(provider, None, load_config())
-                if resumed_key:
-                    api_key = resumed_key
-                else:
+                # Keep a same-provider CLI key, but never reuse an old key across providers.
+                api_key = _resumed_api_key(previous_provider, provider, api_key)
+                if not api_key:
                     env_name = ENV_KEY_NAMES.get(provider, "corresponding env var")
                     print(stylize(f"[note] no API key found for {provider} ({env_name}); "
-                                  f"calls in this session will fail", "red"))
+                                  f"subsequent requests are blocked", "red"))
                 print(f'switched to session "{session["name"]}" provider={provider} model={session["model"]}')
 
             elif cmd == "/list":
@@ -1396,12 +1879,16 @@ def repl(session, api_key):
                           f"{n_msgs} messages  updated {data.get('updated_at')}")
 
             elif cmd == "/new":
-                save_session(session)
                 new_name = arg or default_session_name()
+                if session_path(new_name).exists():
+                    print(f'session "{new_name}" already exists; pick another name or use /resume')
+                    continue
+                save_session(session)
                 # Carry base_url over: openai_responses and similar providers
                 # cannot make calls without it
                 session = new_session(new_name, provider, session["model"], session["system_prompt"],
-                                      base_url=session.get("base_url"))
+                                      base_url=session.get("base_url"),
+                                      web_search=session.get("web_search", False))
                 print(f'started new session "{new_name}"')
 
             elif cmd == "/export":
@@ -1442,6 +1929,21 @@ def repl(session, api_key):
                 else:
                     print(f"current base url: {session.get('base_url') or '(not set, provider default)'}")
 
+            elif cmd == "/web":
+                if provider != "openai_responses":
+                    print("web search currently requires the openai_responses provider.")
+                elif not arg:
+                    enabled = session.get("web_search", False)
+                    print(f"web search: {'on (model decides)' if enabled else 'off'}")
+                elif arg.lower() in ("on", "off"):
+                    session["web_search"] = arg.lower() == "on"
+                    if session["web_search"]:
+                        print("web search enabled; the model decides when to search.")
+                    else:
+                        print("web search disabled.")
+                else:
+                    print("usage: /web [on|off]")
+
             elif cmd == "/history":
                 msgs = session["messages"]
                 if not msgs:
@@ -1467,6 +1969,7 @@ def repl(session, api_key):
 
             elif cmd == "/clear":
                 session["messages"] = []
+                save_session(session, force=True)
                 print("session history cleared.")
 
             else:
@@ -1518,6 +2021,17 @@ def resolve_api_key(provider, cli_key, cfg):
     return None
 
 
+def _resumed_api_key(previous_provider, new_provider, current_key):
+    """Resolve a resumed session key without leaking keys across providers."""
+    resumed_key = resolve_api_key(new_provider, None, load_config())
+    if resumed_key:
+        return resumed_key
+    if new_provider != previous_provider:
+        return None
+    # A same-provider key supplied only through --api-key remains valid.
+    return current_key
+
+
 # Localize argparse help output. argparse translates internally via module-level
 # _() (usage: / error messages etc.); here only the usage prefix is replaced,
 # everything else stays in English (error text is easier to search verbatim).
@@ -1552,11 +2066,13 @@ Examples:
   frz                                       start chatting with the default config
   frz --provider openai --model gpt-4o      pick a provider / model
   frz --resume my-session                   resume a saved session
+  frz --web                                 allow the model to search when needed
+  frz --no-web                              disable web search for a new session
   frz --list-sessions                       list all saved sessions and exit
   frz config set --provider anthropic --api-key sk-ant-xxxx
                                             persist defaults to ~/.frz/config.json
   frz rename old new                        rename a saved session
-  frz clean                                 delete all empty sessions
+  frz clean                                 delete empty sessions and unreferenced attachments
 
 API key precedence: --api-key > environment variable > config file
   anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
@@ -1565,7 +2081,7 @@ API key precedence: --api-key > environment variable > config file
 Models and base urls are stored per provider and never leak across providers.
 
 Once inside a session, type /help for slash commands (/save /resume /export
-/edit /history etc.); Tab completes commands and /resume session names.
+/edit /history etc.); Tab completes commands, /resume session names and @paths.
 """
 
 
@@ -1573,7 +2089,7 @@ def build_arg_parser():
     parser = FrzArgumentParser(
         prog="frz",
         usage="frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n"
-              "          [--base-url URL] [--system PROMPT] [--resume NAME]\n"
+              "          [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]\n"
               "          [--session-name NAME] [--list-sessions] [--version]\n"
               "          {config,rename,clean} ...",
         description="supports Anthropic / OpenAI / Gemini / OpenAI Responses backends",
@@ -1605,10 +2121,9 @@ def build_arg_parser():
     rename_p.add_argument("old_name", help="current session name")
     rename_p.add_argument("new_name", help="new session name")
 
-    # clean subcommand: delete all empty sessions (0 messages)
-    sub.add_parser("clean", help="delete all empty sessions (0-message placeholders)",
-                   description="delete all 0-message empty session files (placeholders); "
-                               "sessions with content are untouched")
+    # clean subcommand: empty sessions and unreferenced attachments past the grace period
+    sub.add_parser("clean", help="delete empty sessions and unreferenced attachments",
+                   description="delete empty sessions and unreferenced attachment snapshots older than 24 hours")
 
     # Default chat arguments (no subcommand -> enter chat)
     parser.add_argument("--provider", choices=list(CALLERS.keys()), metavar="PROVIDER",
@@ -1620,6 +2135,12 @@ def build_arg_parser():
     parser.add_argument("--base-url", metavar="URL",
                         help="custom API base url (required by openai_responses and similar providers)")
     parser.add_argument("--system", metavar="PROMPT", help="system prompt")
+    web_group = parser.add_mutually_exclusive_group()
+    web_group.add_argument("--web", dest="web_search", action="store_true",
+                           help="allow openai_responses models to search when needed")
+    web_group.add_argument("--no-web", dest="web_search", action="store_false",
+                           help="disable web search")
+    parser.set_defaults(web_search=None)
     parser.add_argument("--resume", metavar="NAME", help="resume the named session")
     parser.add_argument("--session-name", metavar="NAME", help="name for the new session (auto-generated if omitted)")
     parser.add_argument("--list-sessions", action="store_true", help="list saved sessions and exit")
@@ -1667,6 +2188,17 @@ def main():
             print(f"deleted empty session: {name}")
         if not removed:
             print("(no empty sessions)")
+        try:
+            freed, count, skipped = _clean_unreferenced_attachments()
+        except RuntimeError as e:
+            print(stylize(f"[note] {e}", "red"))
+            return
+        if count:
+            print(f"removed {count} unreferenced attachments, freed {_format_size(freed)}")
+        if skipped:
+            print(f"(kept {skipped} unreferenced attachments within the 24-hour grace period)")
+        if not count and not skipped:
+            print("(no unreferenced attachments to clean)")
         return
 
     if args.list_sessions:
@@ -1719,9 +2251,15 @@ def main():
             session["base_url"] = args.base_url
         elif "base_url" not in session:
             session["base_url"] = base_url
+        if args.web_search is not None:
+            session["web_search"] = args.web_search
     else:
         name = args.session_name or default_session_name()
-        session = new_session(name, provider, model, args.system or "", base_url=base_url)
+        if session_path(name).exists():
+            print(f'[error] session "{name}" already exists; pick another name or use --resume')
+            sys.exit(1)
+        session = new_session(name, provider, model, args.system or "", base_url=base_url,
+                              web_search=args.web_search)
 
     repl(session, api_key)
 
