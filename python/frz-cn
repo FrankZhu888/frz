@@ -109,7 +109,7 @@ MAX_ATTACHMENTS = 8
 MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_ATTACHMENT_BYTES = 15 * 1024 * 1024
-# 无引用附件保留一天再允许 clean 删除，避免误删其他 frz 进程刚写入的快照。
+# 无引用附件保留一天再允许 clean 删除，避免误删其它 frz 进程刚写入的快照。
 ATTACHMENT_CLEAN_GRACE_SECONDS = 24 * 60 * 60
 
 
@@ -1448,7 +1448,7 @@ def _run_shell_command(command):
 
 
 def _handle_shell_input(user_input):
-    """处理 !命令，以及无需前缀的 ls/pwd/cd；其他输入仍发送给模型。"""
+    """处理 !命令，以及无需前缀的 ls/pwd/cd；其它输入仍发送给模型。"""
     explicit = user_input.startswith("!")
     command = user_input[1:].strip() if explicit else user_input
     if explicit and not command:
@@ -1581,7 +1581,7 @@ HELP_TEXT = """\
     ls / pwd / cd       常用命令也可直接输入；cd 会保留工作目录
     @<文件>             添加文本或图片附件，支持多个附件和 Tab 补全
 
-  其他
+  其它
     /edit                打开编辑器写多行消息（适合贴长日志/长问题），保存退出后发送
     /history [N]         打印对话历史（N=只看最近 N 轮；长输出自动进入分页器）
     /clear               清空当前会话的对话历史（保留 system prompt）
