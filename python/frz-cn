@@ -340,11 +340,23 @@ def rename_session_file(old_name, new_name):
     return True, new_path
 
 
+def _without_empty_assistant(messages):
+    """丢弃历史中的空 assistant 回复，避免 Responses API 拒绝空 input_text。"""
+    return [
+        m for m in messages
+        if m.get("role") != "assistant"
+        or (m.get("content") is not None and str(m["content"]).strip())
+    ]
+
+
 def load_session(name):
     path = session_path(name)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    session = json.loads(path.read_text(encoding="utf-8"))
+    # 兼容旧版本已经写入的空回复；加载时清理，避免恢复会话后连续 400。
+    session["messages"] = _without_empty_assistant(session.get("messages", []))
+    return session
 
 
 def export_session(session, dest=None):
@@ -662,7 +674,7 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
     input_items = [
         {"role": m["role"], "content": _responses_content(m)}
-        for m in messages
+        for m in _without_empty_assistant(messages)
     ]
     payload = {"model": model, "input": input_items, "stream": True}
     if web_search:
@@ -1568,23 +1580,23 @@ HELP_TEXT = """\
     /resume [名字]       切换/恢复到另一个会话（不写名字则续聊最近的会话）
     /list                列出所有已保存的会话
     /new [名字]          开启一个新会话
-    /export [文件]       导出当前会话为 Markdown（默认 ~/.frz/exports/会话名.md）
+    /export [文件]       导出当前会话为Markdown（默认 ~/.frz/exports/会话名.md）
 
   会话配置
-    /system [提示词]     查看或设置 system prompt
+    /system [提示词]     查看或设置system prompt
     /model [模型名]      查看或切换模型
-    /baseurl [地址]      查看或设置自定义 API base url（openai_responses 等 provider 需要）
-    /web [on|off]        查看或设置联网搜索；新会话默认 on，由模型自动决策
+    /baseurl [地址]      查看或设置自定义API base url（openai_responses等provider需要）
+    /web [on|off]        查看或设置联网搜索；新会话默认on，由模型自动决策
 
   本地命令与附件（openai_responses）
     !<命令>              本地执行命令，例如 !ls -la；输出不发送给模型
-    ls / pwd / cd       常用命令也可直接输入；cd 会保留工作目录
-    @<文件>             添加文本或图片附件，支持多个附件和 Tab 补全
+    ls / pwd / cd        常用命令也可直接输入；cd 会保留工作目录
+    @<文件>              添加文本或图片附件，支持多个附件和Tab补全
 
   其它
     /edit                打开编辑器写多行消息（适合贴长日志/长问题），保存退出后发送
-    /history [N]         打印对话历史（N=只看最近 N 轮；长输出自动进入分页器）
-    /clear               清空当前会话的对话历史（保留 system prompt）
+    /history [N]         打印对话历史（N=只看最近N轮；长输出自动进入分页器）
+    /clear               清空当前会话的对话历史（保留system prompt）
     /help                显示本帮助
     /exit 或 /quit       保存并退出
 """
@@ -1898,6 +1910,12 @@ def send_message(session, user_input, provider, api_key):
         return
     finally:
         indicator.stop()
+
+    if not reply or not reply.strip():
+        # 搜索完成但正文为空时不能入库，否则下一轮会携带空 input_text 并连续 400。
+        session["messages"].pop()
+        print(stylize("\n[出错了] 模型未返回正文，本轮消息未计入历史", "red"))
+        return
 
     session["messages"].append({"role": "assistant", "content": reply})
     if not is_streaming:
