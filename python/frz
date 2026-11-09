@@ -53,7 +53,7 @@ Usage examples:
       --model kimi-k3 --base-url https://ark.cn-beijing.volces.com/api/v3 --api-key ark-xxxx
 """
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 __author__ = "Frank Zhu <flankeroot@gmail.com>"
 
 import argparse
