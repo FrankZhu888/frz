@@ -139,6 +139,35 @@ func TestNewSessionWebDefaults(t *testing.T) {
 	}
 }
 
+func TestLegacyEmptyAssistantIsRemovedOnLoad(t *testing.T) {
+	useTempState(t)
+	session := newSession("legacy", "openai_responses", "test", "", "https://example.invalid")
+	session.Messages = []Message{
+		{Role: "user", Content: "old question"},
+		{Role: "assistant", Content: ""},
+		{Role: "assistant", Content: "   \n\t"},
+		{Role: "user", Content: "new question"},
+	}
+	if _, ok := saveSession(session, true); !ok {
+		t.Fatal("save failed")
+	}
+	loaded := loadSession("legacy")
+	if loaded == nil {
+		t.Fatal("session was not loaded")
+	}
+	if len(loaded.Messages) != 2 {
+		t.Fatalf("loaded messages = %#v, want two user messages", loaded.Messages)
+	}
+	for i, message := range loaded.Messages {
+		if message.Role != "user" {
+			t.Fatalf("messages[%d].Role = %q, want user", i, message.Role)
+		}
+	}
+	if loaded.Messages[0].Content != "old question" || loaded.Messages[1].Content != "new question" {
+		t.Fatalf("unexpected loaded messages: %#v", loaded.Messages)
+	}
+}
+
 func TestHelperMain(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER") != "1" {
 		return

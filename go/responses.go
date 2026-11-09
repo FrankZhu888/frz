@@ -64,7 +64,7 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 		return "", fmt.Errorf("openai_responses provider requires base_url; pass --base-url.")
 	}
 	items := []map[string]interface{}{}
-	for _, m := range messages {
+	for _, m := range withoutEmptyAssistant(messages) {
 		content, err := responsesContent(m)
 		if err != nil {
 			return "", err

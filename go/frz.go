@@ -284,6 +284,19 @@ func renameSessionFile(oldName, newName string) (bool, string) {
 	return true, newPath
 }
 
+// withoutEmptyAssistant drops blank assistant replies so legacy sessions cannot
+// send an empty input_text to the Responses API on the next round.
+func withoutEmptyAssistant(messages []Message) []Message {
+	filtered := make([]Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == "assistant" && strings.TrimSpace(m.Content) == "" {
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	return filtered
+}
+
 func loadSession(name string) *Session {
 	data, err := os.ReadFile(sessionPath(name))
 	if err != nil {
@@ -293,6 +306,7 @@ func loadSession(name string) *Session {
 	if json.Unmarshal(data, &s) != nil {
 		return nil
 	}
+	s.Messages = withoutEmptyAssistant(s.Messages)
 	return &s
 }
 
@@ -1629,6 +1643,12 @@ func sendMessage(session *Session, userInput, provider, apiKey string) {
 	if err != nil {
 		fmt.Println(stylize(fmt.Sprintf("\n[error] %v", err), "red"))
 		session.Messages = session.Messages[:len(session.Messages)-1] // failed message is not recorded
+		return
+	}
+	if strings.TrimSpace(reply) == "" {
+		// A completed search with no text must not poison the next request with blank input_text.
+		fmt.Println(stylize("\n[error] model returned no text; this round was not recorded", "red"))
+		session.Messages = session.Messages[:len(session.Messages)-1]
 		return
 	}
 

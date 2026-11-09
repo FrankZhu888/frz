@@ -140,3 +140,81 @@ func TestNetworkErrorIsReturned(t *testing.T) {
 		t.Fatalf("expected network error, got %v", err)
 	}
 }
+
+func TestEmptyResponseIsNotSavedOrSentNextRound(t *testing.T) {
+	useTempState(t)
+	var payloads []map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		payloads = append(payloads, payload)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if len(payloads) > 1 {
+			_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+		}
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer server.Close()
+
+	session := newSession("empty-response", "openai_responses", "test", "", server.URL, true)
+	sendMessage(session, "first question", "openai_responses", "test-key")
+	if len(session.Messages) != 0 {
+		t.Fatalf("empty response was recorded: %#v", session.Messages)
+	}
+
+	sendMessage(session, "second question", "openai_responses", "test-key")
+	if len(payloads) != 2 {
+		t.Fatalf("got %d requests, want 2", len(payloads))
+	}
+	input, ok := payloads[1]["input"].([]interface{})
+	if !ok || len(input) != 1 {
+		t.Fatalf("second request input = %#v, want one user message", payloads[1]["input"])
+	}
+	item := input[0].(map[string]interface{})
+	if item["role"] != "user" {
+		t.Fatalf("second request role = %#v, want user", item["role"])
+	}
+	content := item["content"].([]interface{})
+	text := content[0].(map[string]interface{})["text"]
+	if text != "second question" {
+		t.Fatalf("second request text = %#v", text)
+	}
+	if len(session.Messages) != 2 || session.Messages[1].Content != "ok" {
+		t.Fatalf("normal response was not recorded: %#v", session.Messages)
+	}
+}
+
+func TestRequestBuilderFiltersEmptyAssistant(t *testing.T) {
+	var payload map[string]interface{}
+	stream := "event: response.output_text.delta\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\"}\n"
+	server := responsesTestServer(t, stream, &payload)
+	defer server.Close()
+	messages := []Message{
+		{Role: "user", Content: "old question"},
+		{Role: "assistant", Content: ""},
+		{Role: "assistant", Content: "   \n\t"},
+		{Role: "user", Content: "new question"},
+	}
+	reply, err := callOpenAIResponses(context.Background(), messages, "", "test", "secret", server.URL, nil, nil, false, nil)
+	if err != nil || reply != "ok" {
+		t.Fatalf("reply=%q err=%v", reply, err)
+	}
+	input, ok := payload["input"].([]interface{})
+	if !ok || len(input) != 2 {
+		t.Fatalf("request input = %#v, want two user messages", payload["input"])
+	}
+	for i, raw := range input {
+		item := raw.(map[string]interface{})
+		if item["role"] != "user" {
+			t.Fatalf("input[%d] role = %#v, want user", i, item["role"])
+		}
+	}
+	content := input[1].(map[string]interface{})["content"].([]interface{})
+	if got := content[0].(map[string]interface{})["text"]; got != "new question" {
+		t.Fatalf("last input text = %#v", got)
+	}
+}
