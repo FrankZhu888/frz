@@ -349,11 +349,23 @@ def rename_session_file(old_name, new_name):
     return True, new_path
 
 
+def _without_empty_assistant(messages):
+    """Drop empty assistant replies so the Responses API never receives blank input_text."""
+    return [
+        m for m in messages
+        if m.get("role") != "assistant"
+        or (m.get("content") is not None and str(m["content"]).strip())
+    ]
+
+
 def load_session(name):
     path = session_path(name)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    session = json.loads(path.read_text(encoding="utf-8"))
+    # Older versions may have persisted empty replies; remove them on resume.
+    session["messages"] = _without_empty_assistant(session.get("messages", []))
+    return session
 
 
 def new_session(name, provider, model, system_prompt, base_url=None, web_search=None):
@@ -662,7 +674,7 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
     input_items = [
         {"role": m["role"], "content": _responses_content(m)}
-        for m in messages
+        for m in _without_empty_assistant(messages)
     ]
     payload = {"model": model, "input": input_items, "stream": True}
     if web_search:
@@ -1679,6 +1691,12 @@ def send_message(session, user_input, provider, api_key):
         return
     finally:
         indicator.stop()
+
+    if not reply or not reply.strip():
+        # A completed search with no text must not poison the next request with blank input_text.
+        session["messages"].pop()
+        print(stylize("\n[error] model returned no text; this round was not recorded", "red"))
+        return
 
     session["messages"].append({"role": "assistant", "content": reply})
     if not is_streaming:
