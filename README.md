@@ -7,9 +7,8 @@ crafted Markdown rendering experience. Available in Go and Python editions:
 - **`python/frz`** — the English single-file stdlib-only edition
 - **`python/frz-cn`** — the Chinese-localized single-file stdlib-only edition
 
-The Python editions also include local shell commands, file/image attachments,
-content-addressed attachment storage, and automatic web search. Go support for
-these newer features is being synchronized.
+Both the Go and Python editions include local shell commands, file/image
+attachments, content-addressed attachment storage, and automatic web search.
 
 ## Features
 
@@ -25,16 +24,16 @@ these newer features is being synchronized.
 - **Sessions**: save / resume / list / rename / export to Markdown, stored in
   `~/.frz/sessions/*.json` using atomic writes and owner-only permissions
 - **Local commands**: run `!<command>` or bare `ls` / `pwd` / `cd`; output stays
-  local and is not added to model context (Python editions)
+  local and is not added to model context (Go and Python editions)
 - **File and image attachments**: use `@<file>` with filenames, relative paths,
   absolute paths, or quoted paths. Supports multiple attachments and Tab completion.
-  Limits are 2 MiB per text file, 10 MiB per image, and 15 MiB per message (Python editions)
+  Limits are 2 MiB per text file, 10 MiB per image, and 15 MiB per message (Go and Python editions)
 - **Attachment snapshots**: content-addressed blobs in `~/.frz/attachments/<sha256>`
   keep session JSON small, deduplicate content, and support legacy-session migration
-  and safe cleanup (Python editions)
+  and safe cleanup (Go and Python editions)
 - **Automatic web search**: Responses models decide when to search. New Responses
   sessions default to enabled; control it with `/web on|off` or `--web/--no-web`.
-  Search activity and thinking status are shown while waiting (Python editions)
+  Search activity and thinking status are shown while waiting (Go and Python editions)
 - **Comfortable REPL**: slash commands, Tab completion (commands, session names,
   and attachment paths), `/edit` for multi-line input in `$EDITOR`, `/history [N]`
   with automatic paging, and a shimmer thinking spinner
@@ -135,7 +134,7 @@ API key resolution order: `--api-key` > environment variable > config file
 | `/clear` | Clear current session history |
 | `/exit` | Save and quit |
 
-## Local commands and attachments (Python editions)
+## Local commands and attachments (Go and Python editions)
 
 ```text
 > !git status                 Run a command locally; output stays out of context
@@ -152,10 +151,15 @@ period. Session files use owner-only permissions and atomic replacement.
 
 ## Tests
 
-The Python edition includes feature and regression tests for local commands,
-attachments, storage, web search, sessions, permissions, and SSE error handling:
+The Go and Python editions include feature and regression tests for local
+commands, attachments, storage, web search, sessions, permissions, and SSE error
+handling:
 
 ```bash
+# Go: 30 test functions plus race detection
+cd go && go test ./... && go test -race ./...
+
+# Python: 32 feature and regression tests
 python3 -I -m unittest discover -s python/tests -v
 ```
 

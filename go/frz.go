@@ -10,14 +10,19 @@
 //   - Sessions can be saved / resumed / listed / exported to Markdown,
 //     stored in ~/.frz/sessions/*.json
 //   - REPL slash commands: /help /save /rename /resume /list /new /export /edit
-//     /system /model /baseurl /history /clear /exit
-//   - REPL input comforts: Tab completion (commands & session names), /edit for
-//     multi-line input in $EDITOR, /history with automatic paging,
+//     /system /model /baseurl /web /history /clear /exit
+//   - REPL input comforts: Tab completion (commands, session names and @paths),
+//     /edit for multi-line input in $EDITOR, /history with automatic paging,
 //     /resume without a name resumes the most recent session
+//   - Local commands: !command and bare ls / pwd / cd; output stays out of model context
+//   - openai_responses @text/@image attachments using filenames, relative or absolute paths;
+//     2 MiB text / 10 MiB image / 15 MiB total limits; content-addressed snapshots
+//   - Web search is enabled by default for new Responses sessions and controlled by
+//     /web on|off or --web/--no-web; search status is shown while waiting
+//   - Atomic owner-only session writes, legacy attachment migration and safe cleanup
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -70,6 +75,7 @@ func versionString() string {
 var (
 	appDir     = filepath.Join(os.Getenv("HOME"), ".frz")
 	sessDir    = filepath.Join(appDir, "sessions")
+	attachDir  = filepath.Join(appDir, "attachments")
 	exportDir  = filepath.Join(appDir, "exports")
 	configFile = filepath.Join(appDir, "config.json")
 )
@@ -103,7 +109,18 @@ var streamingProviders = map[string]bool{"openai_responses": true}
 // Basic utilities
 // --------------------------------------------------------------------------
 
-func ensureDirs() { os.MkdirAll(sessDir, 0o755) }
+func ensureDirs() {
+	os.MkdirAll(sessDir, 0o700)
+	os.MkdirAll(attachDir, 0o700)
+	for _, dir := range []string{sessDir, attachDir} {
+		os.Chmod(dir, 0o700)
+	}
+	// Tighten permissions on sessions created by earlier versions.
+	paths, _ := filepath.Glob(filepath.Join(sessDir, "*.json"))
+	for _, path := range paths {
+		os.Chmod(path, 0o600)
+	}
+}
 
 // loadConfig reads the config into a generic map (preserves all fields,
 // including ones added in the future)
@@ -121,20 +138,19 @@ func loadConfig() map[string]interface{} {
 
 func saveConfig(cfg map[string]interface{}) {
 	ensureDirs()
-	writeJSONFile(configFile, cfg)
-	os.Chmod(configFile, 0o600)
+	_ = writeJSONFile(configFile, cfg)
 }
 
-// writeJSONFile writes JSON with indent=2 without escaping HTML/Unicode
-func writeJSONFile(path string, v interface{}) {
+// writeJSONFile atomically writes JSON with indent=2 and owner-only permissions.
+func writeJSONFile(path string, v interface{}) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
-		return
+		return err
 	}
-	os.WriteFile(path, buf.Bytes(), 0o644)
+	return writeBytesAtomic(path, buf.Bytes(), 0o600)
 }
 
 func cfgStr(cfg map[string]interface{}, key string) string {
@@ -164,8 +180,9 @@ func sessionPath(name string) string {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role        string       `json:"role"`
+	Content     string       `json:"content"`
+	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
 type Session struct {
@@ -174,6 +191,7 @@ type Session struct {
 	Model        string    `json:"model"`
 	BaseURL      string    `json:"base_url"`
 	SystemPrompt string    `json:"system_prompt"`
+	WebSearch    bool      `json:"web_search"`
 	CreatedAt    string    `json:"created_at"`
 	UpdatedAt    string    `json:"updated_at"`
 	Messages     []Message `json:"messages"`
@@ -220,9 +238,16 @@ func saveSession(s *Session, force bool) (string, bool) {
 		return "", false
 	}
 	ensureDirs()
+	if err := externalizeSessionAttachments(s); err != nil {
+		fmt.Println(stylize("[error] "+err.Error(), "red"))
+		return "", false
+	}
 	s.UpdatedAt = time.Now().Format("2006-01-02T15:04:05")
 	path := sessionPath(s.Name)
-	writeJSONFile(path, s)
+	if err := writeJSONFile(path, s); err != nil {
+		fmt.Println(stylize("[error] cannot save session: "+err.Error(), "red"))
+		return "", false
+	}
 	return path, true
 }
 
@@ -250,7 +275,9 @@ func renameSessionFile(oldName, newName string) (bool, string) {
 	}
 	s["name"] = newName
 	s["updated_at"] = nowISO()
-	writeJSONFile(newPath, s)
+	if err := writeJSONFile(newPath, s); err != nil {
+		return false, fmt.Sprintf("cannot rename session: %v", err)
+	}
 	if newPath != oldPath {
 		os.Remove(oldPath)
 	}
@@ -269,10 +296,14 @@ func loadSession(name string) *Session {
 	return &s
 }
 
-func newSession(name, provider, model, systemPrompt, baseURL string) *Session {
+func newSession(name, provider, model, systemPrompt, baseURL string, webSearch ...bool) *Session {
+	enabled := provider == "openai_responses"
+	if len(webSearch) > 0 {
+		enabled = webSearch[0]
+	}
 	return &Session{
 		Name: name, Provider: provider, Model: model, BaseURL: baseURL,
-		SystemPrompt: systemPrompt, CreatedAt: nowISO(), UpdatedAt: nowISO(),
+		SystemPrompt: systemPrompt, WebSearch: enabled, CreatedAt: nowISO(), UpdatedAt: nowISO(),
 		Messages: []Message{},
 	}
 }
@@ -293,6 +324,9 @@ func exportSession(s *Session, dest string) (string, bool) {
 			role = "User"
 		}
 		fmt.Fprintf(&b, "\n## %s\n\n%s\n", role, m.Content)
+		for _, label := range attachmentLabels(m) {
+			fmt.Fprintf(&b, "\n> Attachment: %s\n", label)
+		}
 	}
 	path := dest
 	if path == "" {
@@ -337,7 +371,10 @@ func httpPostJSON(ctx context.Context, url string, headers map[string]string, pa
 		return nil, fmt.Errorf("network error: %v", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read response: %v", readErr)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
@@ -453,111 +490,22 @@ func callGemini(ctx context.Context, messages []Message, system, model, apiKey, 
 	return b.String(), nil
 }
 
-// callOpenAIResponses speaks the OpenAI Responses API protocol
-// (POST {baseURL}/responses) with SSE streaming. Many vendors (e.g. Volcengine
-// Ark) expose OpenAI-compatible capability through this protocol.
-func callOpenAIResponses(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, onDelta, onReasoning func(string)) (string, error) {
-	if baseURL == "" {
-		return "", fmt.Errorf("openai_responses provider requires base_url; pass --base-url.")
-	}
-	url := strings.TrimRight(baseURL, "/") + "/responses"
-	items := []map[string]interface{}{}
-	for _, m := range messages {
-		items = append(items, map[string]interface{}{
-			"role":    m.Role,
-			"content": []map[string]string{{"type": "input_text", "text": m.Content}},
-		})
-	}
-	payload := map[string]interface{}{"model": model, "input": items, "stream": true}
-	if system != "" {
-		payload["instructions"] = system
-	}
-	data, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		if ctx.Err() == context.Canceled {
-			return "", errInterrupted
-		}
-		return "", fmt.Errorf("network error: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	var full strings.Builder
-	var currentEvent string
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		line = strings.TrimRight(line, "\r\n")
-		if line != "" {
-			if strings.HasPrefix(line, "event:") {
-				currentEvent = strings.TrimSpace(line[len("event:"):])
-			} else if strings.HasPrefix(line, "data:") {
-				dataStr := strings.TrimSpace(line[len("data:"):])
-				if dataStr != "" && dataStr != "[DONE]" {
-					var evt map[string]interface{}
-					if json.Unmarshal([]byte(dataStr), &evt) == nil {
-						etype := currentEvent
-						if etype == "" {
-							etype = asString(evt["type"])
-						}
-						switch etype {
-						case "response.output_text.delta":
-							if d := asString(evt["delta"]); d != "" {
-								full.WriteString(d)
-								if onDelta != nil {
-									onDelta(d)
-								}
-							}
-						case "response.reasoning_summary_text.delta":
-							// Reasoning deltas don't count as reply content; used
-							// only as a "still thinking" heartbeat for the spinner
-							if onReasoning != nil {
-								onReasoning(asString(evt["delta"]))
-							}
-						case "response.failed":
-							msg := asString(asMap(asMap(evt["response"])["error"])["message"])
-							if msg == "" {
-								msg = "unknown error"
-							}
-							return "", fmt.Errorf("upstream error: %s", msg)
-						case "response.completed":
-							return full.String(), nil
-						}
-					}
-				}
-			}
-		}
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				return "", errInterrupted
-			}
-			break
-		}
-	}
-	return full.String(), nil
-}
-
 type callerFunc func(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, onDelta, onReasoning func(string)) (string, error)
 
 var callers = map[string]callerFunc{
-	"anthropic":        callAnthropic,
-	"openai":           callOpenAI,
-	"gemini":           callGemini,
-	"openai_responses": callOpenAIResponses,
+	"anthropic": callAnthropic,
+	"openai":    callOpenAI,
+	"gemini":    callGemini,
+	"openai_responses": func(ctx context.Context, messages []Message, system, model, apiKey, baseURL string, onDelta, onReasoning func(string)) (string, error) {
+		return callOpenAIResponses(ctx, messages, system, model, apiKey, baseURL, onDelta, onReasoning, false, nil)
+	},
 }
 
-func callModel(ctx context.Context, provider string, messages []Message, system, model, apiKey, baseURL string, onDelta, onReasoning func(string)) (string, error) {
+func callModel(ctx context.Context, provider string, messages []Message, system, model, apiKey, baseURL string,
+	onDelta, onReasoning func(string), webSearch bool, onSearch func(string)) (string, error) {
+	if provider == "openai_responses" {
+		return callOpenAIResponses(ctx, messages, system, model, apiKey, baseURL, onDelta, onReasoning, webSearch, onSearch)
+	}
 	fn, ok := callers[provider]
 	if !ok {
 		return "", fmt.Errorf("unknown provider: %s", provider)
@@ -1198,7 +1146,7 @@ func (r *markdownRenderer) renderTable() string {
 		segs[j] = strings.Repeat("─", w+2) // +2 for the space padding on both sides
 	}
 	border := func(left, mid, right string) string {
-		return stylize(left + strings.Join(segs, mid) + right, "gray")
+		return stylize(left+strings.Join(segs, mid)+right, "gray")
 	}
 	makeRow := func(cells []string, cellStyle string) string {
 		parts := make([]string, ncols)
@@ -1268,12 +1216,17 @@ func renderMarkdown(text string) string {
 // streamRenderer is a line-buffered renderer for streaming output: renders only
 // complete lines (Markdown syntax closes per line)
 type streamRenderer struct {
-	r   *markdownRenderer
-	buf string
+	r        *markdownRenderer
+	buf      string
+	onOutput func()
 }
 
-func newStreamRenderer() *streamRenderer {
-	return &streamRenderer{r: &markdownRenderer{}}
+func newStreamRenderer(onOutput ...func()) *streamRenderer {
+	s := &streamRenderer{r: &markdownRenderer{}}
+	if len(onOutput) > 0 {
+		s.onOutput = onOutput[0]
+	}
+	return s
 }
 
 func (s *streamRenderer) feed(text string) {
@@ -1292,13 +1245,22 @@ func (s *streamRenderer) finish() {
 		s.buf = ""
 	}
 	if tail, ok := s.r.flush(); ok {
-		fmt.Println(tail)
+		s.print(tail)
 	}
+}
+
+func (s *streamRenderer) print(text string) {
+	if s.onOutput != nil {
+		callback := s.onOutput
+		s.onOutput = nil
+		callback()
+	}
+	fmt.Println(text)
 }
 
 func (s *streamRenderer) emit(line string) {
 	if rendered, ok := s.r.feedLine(line); ok {
-		fmt.Println(rendered)
+		s.print(rendered)
 	}
 }
 
@@ -1309,7 +1271,7 @@ func (s *streamRenderer) emit(line string) {
 // --------------------------------------------------------------------------
 
 var thinkingVerbs = []string{"Thinking", "Pondering", "Mulling", "Brewing", "Wondering",
-	"Deliberating", "Computing", "Searching", "Weaving", "Wandering"}
+	"Deliberating", "Computing", "Analyzing", "Weaving", "Wandering"}
 
 const (
 	shimmerBase = "\033[38;2;147;165;255m" // claudeBlue_FOR_SYSTEM_SPINNER
@@ -1350,10 +1312,10 @@ func (ti *thinkingIndicator) start() {
 	go ti.run()
 }
 
-func (ti *thinkingIndicator) setState(state string) {
+func (ti *thinkingIndicator) setState(state string, force ...bool) {
 	ti.mu.Lock()
 	defer ti.mu.Unlock()
-	if ti.state == "Waiting" {
+	if ti.state == "Waiting" || (len(force) > 0 && force[0]) {
 		ti.state = state
 	}
 }
@@ -1428,6 +1390,9 @@ func formatHistory(messages []Message) string {
 			for _, line := range strings.Split(m.Content, "\n") {
 				out = append(out, stylize("> ", "green")+line)
 			}
+			for _, label := range attachmentLabels(m) {
+				out = append(out, stylize("> ", "green")+"[Attachment: "+label+"]")
+			}
 		} else {
 			out = append(out, renderMarkdown(m.Content))
 		}
@@ -1462,7 +1427,7 @@ func pageText(text string) {
 // Slash commands offered for Tab completion
 var replCommands = []string{
 	"/baseurl", "/clear", "/edit", "/exit", "/export", "/help", "/history",
-	"/list", "/model", "/new", "/quit", "/rename", "/resume", "/save", "/system",
+	"/list", "/model", "/new", "/quit", "/rename", "/resume", "/save", "/system", "/web",
 }
 
 type frzCompleter struct{}
@@ -1471,6 +1436,21 @@ type frzCompleter struct{}
 // command names at line start
 func (frzCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	s := string(line[:pos])
+	if idx := strings.LastIndexAny(s, " \t"); idx >= 0 && strings.HasPrefix(s[idx+1:], "@") {
+		token := s[idx+1:]
+		var out [][]rune
+		for _, candidate := range pathCompletionMatches(token) {
+			out = append(out, []rune(candidate[len(token):]))
+		}
+		return out, len([]rune(token))
+	}
+	if strings.HasPrefix(s, "@") && !strings.ContainsAny(s, " \t") {
+		var out [][]rune
+		for _, candidate := range pathCompletionMatches(s) {
+			out = append(out, []rune(candidate[len(s):]))
+		}
+		return out, len([]rune(s))
+	}
 	if strings.HasPrefix(s, "/resume ") || strings.HasPrefix(s, "/resume\t") {
 		idx := strings.LastIndexAny(s, " \t")
 		prefix := s[idx+1:]
@@ -1509,6 +1489,13 @@ const helpText = `Available commands:
     /model [name]        View or switch model
     /baseurl [url]       View or set custom API base url (required by
                          openai_responses and similar providers)
+    /web [on|off]        View or control web search; new Responses sessions
+                         default to on and the model decides when to search
+
+  Local commands & attachments (openai_responses)
+    !<command>           Run a local command, e.g. !ls -la; output stays local
+    ls / pwd / cd        Also available without !; cd persists the working directory
+    @<file>              Attach text or images; multiple files and Tab completion supported
 
   Other
     /edit                Compose a multi-line message in your editor (great for
@@ -1574,7 +1561,19 @@ func editInEditor() string {
 // sendMessage sends one user message to the model and renders the reply;
 // on failure/interruption the message is not recorded
 func sendMessage(session *Session, userInput, provider, apiKey string) {
-	session.Messages = append(session.Messages, Message{Role: "user", Content: userInput})
+	if apiKey == "" {
+		fmt.Println(stylize(fmt.Sprintf("[error] no API key available for provider=%s; request cancelled", provider), "red"))
+		return
+	}
+	message, buildErr := buildUserMessage(userInput, provider)
+	if buildErr != nil {
+		fmt.Println(stylize("[attachment error] "+buildErr.Error(), "red"))
+		return
+	}
+	session.Messages = append(session.Messages, message)
+	for _, label := range attachmentLabels(message) {
+		fmt.Println(stylize("[attachment] "+label, "gray"))
+	}
 	isStreaming := streamingProviders[provider]
 
 	// Ctrl-C cancels this round: context cancels the HTTP call, message dropped
@@ -1599,20 +1598,26 @@ func sendMessage(session *Session, userInput, provider, apiKey string) {
 	var err error
 	if isStreaming {
 		fmt.Println()
-		stream := newStreamRenderer()
-		onDelta := func(text string) {
-			indicator.stop()
-			stream.feed(text)
-		}
+		stream := newStreamRenderer(indicator.stop)
+		onDelta := func(text string) { stream.feed(text) }
 		onReasoning := func(string) { indicator.randomVerb() }
+		onSearch := func(state string) {
+			if state == "completed" {
+				indicator.setState(indicator.rng.pick(), true)
+			} else if state == "failed" {
+				indicator.setState("Search failed", true)
+			} else {
+				indicator.setState("Searching", true)
+			}
+		}
 		reply, err = callModel(ctx, provider, session.Messages, session.SystemPrompt,
-			session.Model, apiKey, session.BaseURL, onDelta, onReasoning)
+			session.Model, apiKey, session.BaseURL, onDelta, onReasoning, session.WebSearch, onSearch)
 		indicator.stop()
 		stream.finish()
 		fmt.Println()
 	} else {
 		reply, err = callModel(ctx, provider, session.Messages, session.SystemPrompt,
-			session.Model, apiKey, session.BaseURL, nil, nil)
+			session.Model, apiKey, session.BaseURL, nil, nil, false, nil)
 		indicator.stop()
 	}
 
@@ -1666,6 +1671,10 @@ func repl(session *Session, apiKey string) {
 			continue
 		}
 
+		if handleShellInput(userInput) {
+			continue
+		}
+
 		if strings.HasPrefix(userInput, "/") {
 			cmd := userInput
 			arg := ""
@@ -1705,6 +1714,15 @@ func repl(session *Session, apiKey string) {
 					continue
 				}
 				oldName := session.Name
+				if _, err := os.Stat(sessionPath(oldName)); os.IsNotExist(err) && len(session.Messages) == 0 {
+					if _, targetErr := os.Stat(sessionPath(arg)); targetErr == nil {
+						fmt.Printf("session %q already exists, pick another name\n", arg)
+					} else {
+						fmt.Printf("renamed session %q to %q\n", oldName, arg)
+						session.Name = arg
+					}
+					continue
+				}
 				saveSession(session, false) // persist latest content first, then rename as a whole
 				if ok, result := renameSessionFile(oldName, arg); ok {
 					session.Name = arg
@@ -1735,18 +1753,17 @@ func repl(session *Session, apiKey string) {
 					fmt.Printf("session %q not found; type /list to see saved sessions.\n", target)
 					continue
 				}
+				previousProvider := provider
 				session = loaded
 				provider = session.Provider
-				// The resumed session may belong to another provider; re-resolve
-				// the key against the session's own provider to avoid a 401
-				if resumedKey := resolveAPIKey(provider, "", loadConfig()); resumedKey != "" {
-					apiKey = resumedKey
-				} else {
+				// Keep a same-provider CLI key, but never reuse an old key across providers.
+				apiKey = resumedAPIKey(previousProvider, provider, apiKey)
+				if apiKey == "" {
 					envName := envKeyNames[provider]
 					if envName == "" {
 						envName = "corresponding env var"
 					}
-					fmt.Println(stylize(fmt.Sprintf("[note] no API key found for %s (%s); calls in this session will fail", provider, envName), "red"))
+					fmt.Println(stylize(fmt.Sprintf("[note] no API key found for %s (%s); subsequent requests are blocked", provider, envName), "red"))
 				}
 				fmt.Printf("switched to session %q provider=%s model=%s\n", session.Name, provider, session.Model)
 
@@ -1761,14 +1778,18 @@ func repl(session *Session, apiKey string) {
 				}
 
 			case "/new":
-				saveSession(session, false)
 				newName := arg
 				if newName == "" {
 					newName = defaultSessionName()
 				}
+				if _, err := os.Stat(sessionPath(newName)); err == nil {
+					fmt.Printf("session %q already exists; pick another name or use /resume\n", newName)
+					continue
+				}
+				saveSession(session, false)
 				// Carry base_url over: openai_responses and similar providers
 				// cannot make calls without it
-				session = newSession(newName, provider, session.Model, session.SystemPrompt, session.BaseURL)
+				session = newSession(newName, provider, session.Model, session.SystemPrompt, session.BaseURL, session.WebSearch)
 				fmt.Printf("started new session %q\n", newName)
 
 			case "/export":
@@ -1822,6 +1843,22 @@ func repl(session *Session, apiKey string) {
 					fmt.Println("current base url: (not set, provider default)")
 				}
 
+			case "/web":
+				if provider != "openai_responses" {
+					fmt.Println("web search currently requires the openai_responses provider.")
+				} else if arg == "" {
+					fmt.Printf("web search: %s\n", map[bool]string{true: "on (model decides)", false: "off"}[session.WebSearch])
+				} else if arg == "on" || arg == "off" {
+					session.WebSearch = arg == "on"
+					if session.WebSearch {
+						fmt.Println("web search enabled; the model decides when to search.")
+					} else {
+						fmt.Println("web search disabled.")
+					}
+				} else {
+					fmt.Println("usage: /web [on|off]")
+				}
+
 			case "/history":
 				msgs := session.Messages
 				if len(msgs) == 0 {
@@ -1850,6 +1887,7 @@ func repl(session *Session, apiKey string) {
 
 			case "/clear":
 				session.Messages = nil
+				saveSession(session, true)
 				fmt.Println("session history cleared.")
 
 			default:
@@ -1916,8 +1954,19 @@ func resolveAPIKey(provider, cliKey string, cfg map[string]interface{}) string {
 	return ""
 }
 
+func resumedAPIKey(previousProvider, newProvider, currentKey string) string {
+	if key := resolveAPIKey(newProvider, "", loadConfig()); key != "" {
+		return key
+	}
+	if newProvider != previousProvider {
+		return ""
+	}
+	// A same-provider key supplied only through --api-key remains valid.
+	return currentKey
+}
+
 const helpUsage = `usage: frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]
-           [--base-url URL] [--system PROMPT] [--resume NAME]
+           [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]
            [--session-name NAME] [--list-sessions] [--version]
            {config,rename,clean} ...
 
@@ -1928,6 +1977,8 @@ options:
   --api-key KEY        API key (can also come from env var or config, see below)
   --base-url URL       custom API base url (required by openai_responses and similar providers)
   --system PROMPT      system prompt
+  --web                allow openai_responses models to search when needed
+  --no-web             disable web search
   --resume NAME        resume the named session
   --session-name NAME  name for the new session (auto-generated if omitted)
   --list-sessions      list saved sessions and exit
@@ -1942,11 +1993,13 @@ Examples:
   frz                                       start chatting with the default config
   frz --provider openai --model gpt-4o      pick a provider / model
   frz --resume my-session                   resume a saved session
+  frz --web                                 allow the model to search when needed
+  frz --no-web                              disable web search for a new session
   frz --list-sessions                       list all saved sessions and exit
   frz config set --provider anthropic --api-key sk-ant-xxxx
                                             persist defaults to ~/.frz/config.json
   frz rename old new                        rename a saved session
-  frz clean                                 delete all empty sessions
+  frz clean                                 delete empty sessions and unreferenced attachments
 
 API key precedence: --api-key > environment variable > config file
   anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
@@ -1997,7 +2050,7 @@ var mainFlagNames = map[string]bool{
 	"system": true, "resume": true, "session-name": true,
 }
 
-var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true}
+var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true, "web": true, "no-web": true}
 
 func main() {
 	ensureDirs()
@@ -2036,9 +2089,13 @@ func main() {
 	if err != nil {
 		fmt.Println(err)
 		fmt.Print("usage: frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n" +
-			"           [--base-url URL] [--system PROMPT] [--resume NAME]\n" +
+			"           [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]\n" +
 			"           [--session-name NAME] [--list-sessions] [--version]\n" +
 			"           {config,rename,clean} ...\n")
+		os.Exit(1)
+	}
+	if flags["web"] == "true" && flags["no-web"] == "true" {
+		fmt.Println("[error] --web and --no-web cannot be used together")
 		os.Exit(1)
 	}
 	if flags["version"] == "true" {
@@ -2119,12 +2176,27 @@ func main() {
 		} else if session.BaseURL == "" {
 			session.BaseURL = baseURL
 		}
+		if flags["web"] == "true" {
+			session.WebSearch = true
+		} else if flags["no-web"] == "true" {
+			session.WebSearch = false
+		}
 	} else {
 		name := flags["session-name"]
 		if name == "" {
 			name = defaultSessionName()
 		}
-		session = newSession(name, provider, model, flags["system"], baseURL)
+		if _, err := os.Stat(sessionPath(name)); err == nil {
+			fmt.Printf("[error] session %q already exists; pick another name or use --resume\n", name)
+			os.Exit(1)
+		}
+		webSearch := provider == "openai_responses"
+		if flags["web"] == "true" {
+			webSearch = true
+		} else if flags["no-web"] == "true" {
+			webSearch = false
+		}
+		session = newSession(name, provider, model, flags["system"], baseURL, webSearch)
 	}
 
 	repl(session, apiKey)
@@ -2222,5 +2294,19 @@ func cmdClean() {
 	}
 	if len(removed) == 0 {
 		fmt.Println("(no empty sessions)")
+	}
+	freed, count, skipped, err := cleanUnreferencedAttachments(attachmentCleanGrace)
+	if err != nil {
+		fmt.Println(stylize("[note] "+err.Error(), "red"))
+		return
+	}
+	if count > 0 {
+		fmt.Printf("removed %d unreferenced attachments, freed %s\n", count, formatSize(freed))
+	}
+	if skipped > 0 {
+		fmt.Printf("(kept %d unreferenced attachments within the 24-hour grace period)\n", skipped)
+	}
+	if count == 0 && skipped == 0 {
+		fmt.Println("(no unreferenced attachments to clean)")
 	}
 }
