@@ -104,6 +104,58 @@ DEFAULT_BASE_URLS = {
 # 使用真正流式打字机输出的 provider（边生成边打印，而不是等全部返回再打印）
 STREAMING_PROVIDERS = {"openai_responses"}
 
+# 调试日志默认关闭，只写 stderr；绝不输出请求头、API Key 或对话请求正文。
+VERBOSE = os.environ.get("FRZ_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+_DEBUG_MAX_CHARS = 12000
+
+
+def _debug(message):
+    if VERBOSE:
+        print(f"[debug] {message}", file=sys.stderr, flush=True)
+
+
+def _debug_json(value):
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(text) > _DEBUG_MAX_CHARS:
+        return text[:_DEBUG_MAX_CHARS] + f"...<truncated {len(text) - _DEBUG_MAX_CHARS} chars>"
+    return text
+
+
+def _debug_url(url):
+    # Gemini 等 URL 可能带 key 查询参数；用户信息及常见凭据参数必须脱敏。
+    url = re.sub(r"(https?://)[^/@\s]+@", r"\1<redacted>@", url)
+    return re.sub(r"([?&](?:key|api[-_]?key|access_token)=)[^&]*",
+                  r"\1<redacted>", url, flags=re.IGNORECASE)
+
+
+def _debug_response_headers(headers):
+    if not VERBOSE or not headers:
+        return
+    # 只记录排障所需的白名单字段，避免输出 Cookie 等无关敏感信息。
+    for name in ("content-type", "x-request-id", "request-id", "x-tt-logid",
+                 "trace-id", "x-trace-id", "retry-after"):
+        value = headers.get(name)
+        if value:
+            _debug(f"response {name}: {value}")
+
+
+def _upstream_error_detail(evt):
+    response = evt.get("response")
+    if not isinstance(response, dict):
+        response = {}
+    error = response.get("error") or evt.get("error")
+    parts = []
+    if response.get("id"):
+        parts.append(f"response_id={response['id']}")
+    if isinstance(error, dict):
+        for key in ("code", "type", "message", "param"):
+            if error.get(key):
+                parts.append(f"{key}={error[key]}")
+    elif error:
+        parts.append(str(error))
+    # 某些上游只返回状态或非标准错误结构，不能再折叠成 unknown error。
+    return "; ".join(parts) if parts else _debug_json(evt)
+
 # @附件限制：拒绝超限文件，不做静默截断。Base64 后请求体约再增大 1/3。
 MAX_ATTACHMENTS = 8
 MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024
@@ -550,15 +602,25 @@ def _attachment_labels(message):
 def _http_post_json(url, headers, payload, timeout=300):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    started = time.monotonic()
+    _debug(f"HTTP POST {_debug_url(url)}; timeout={timeout}s; body={len(data)} bytes")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            _debug(f"HTTP {resp.status} {resp.reason}; elapsed={time.monotonic() - started:.2f}s")
+            _debug_response_headers(resp.headers)
+            body = resp.read()
+            _debug(f"HTTP response body: {len(body)} bytes")
+            return json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as e:
+        _debug(f"HTTP {e.code}; elapsed={time.monotonic() - started:.2f}s")
+        _debug_response_headers(e.headers)
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code} 错误: {body}") from e
     except urllib.error.URLError as e:
+        _debug(f"request failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"网络错误: {e.reason}") from e
     except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        _debug(f"request failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"读取响应失败: {e}") from e
 
 
@@ -689,8 +751,13 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
     full_text = []
     current_event = None
     completed = False
+    started = time.monotonic()
+    _debug(f"HTTP POST {_debug_url(url)}; model={model}; web_search={web_search}; "
+           f"messages={len(input_items)}; timeout=300s")
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
+            _debug(f"HTTP {resp.status} {resp.reason}; elapsed={time.monotonic() - started:.2f}s")
+            _debug_response_headers(resp.headers)
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
@@ -711,10 +778,16 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
                 try:
                     evt = json.loads(data_str)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    _debug(f"invalid SSE JSON: {e}; data={data_str[:2000]!r}")
                     continue
 
                 etype = evt.get("type") or event_for_data
+                if etype in ("response.output_text.delta", "response.reasoning_summary_text.delta"):
+                    # 正文和推理内容不重复写日志，只记录增量长度和事件节奏。
+                    _debug(f"SSE {etype}: delta_chars={len(evt.get('delta') or '')}")
+                else:
+                    _debug(f"SSE {etype or '<unknown>'}: {_debug_json(evt)}")
 
                 if etype == "response.output_text.delta":
                     delta_text = evt.get("delta", "")
@@ -734,11 +807,7 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
                         on_search(etype.rsplit(".", 1)[-1])
 
                 elif etype in ("error", "response.failed"):
-                    response = evt.get("response", {})
-                    err = response.get("error", {}).get("message")
-                    if not err:
-                        err = evt.get("error", {}).get("message", "unknown error")
-                    raise RuntimeError(f"上游返回失败: {err}")
+                    raise RuntimeError(f"上游返回失败: {_upstream_error_detail(evt)}")
 
                 elif etype == "response.incomplete":
                     response = evt.get("response", {})
@@ -748,17 +817,24 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
                 elif etype == "response.completed":
                     completed = True
+                    if not full_text:
+                        _debug("response.completed received without output text")
                     break
 
     except urllib.error.HTTPError as e:
+        _debug(f"HTTP {e.code}; elapsed={time.monotonic() - started:.2f}s")
+        _debug_response_headers(e.headers)
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code} 错误: {body}") from e
     except urllib.error.URLError as e:
+        _debug(f"stream failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"网络错误: {e.reason}") from e
     except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        _debug(f"stream failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"读取响应流失败: {e}") from e
 
     if not completed:
+        _debug(f"stream ended before response.completed; elapsed={time.monotonic() - started:.2f}s")
         raise RuntimeError("响应流在 response.completed 前结束，已丢弃可能不完整的回答")
     return "".join(full_text)
 
@@ -1522,7 +1598,7 @@ def _page_text(text):
 # Tab 补全用的斜杠命令清单（排序后补全菜单更可读）
 _REPL_COMMANDS = sorted([
     "/help", "/save", "/rename", "/resume", "/list", "/new", "/export", "/edit",
-    "/system", "/model", "/baseurl", "/web", "/history", "/clear", "/exit", "/quit",
+    "/system", "/model", "/baseurl", "/web", "/verbose", "/history", "/clear", "/exit", "/quit",
 ])
 
 
@@ -1587,6 +1663,7 @@ HELP_TEXT = """\
     /model [模型名]      查看或切换模型
     /baseurl [地址]      查看或设置自定义API base url（openai_responses等provider需要）
     /web [on|off]        查看或设置联网搜索；新会话默认on，由模型自动决策
+    /verbose [on|off]    查看或设置详细调试日志（仅当前进程，输出到stderr）
 
   本地命令与附件（openai_responses）
     !<命令>              本地执行命令，例如 !ls -la；输出不发送给模型
@@ -1603,6 +1680,7 @@ HELP_TEXT = """\
 
 
 def repl(session, api_key):
+    global VERBOSE
     provider = session["provider"]
     print(f"frz {__version__}  进入会话「{session['name']}」  provider={provider}  model={session['model']}")
     print("输入 /help 查看命令，输入 /exit 保存并退出。\n")
@@ -1810,6 +1888,15 @@ def repl(session, api_key):
                         print("已关闭联网搜索。")
                 else:
                     print("用法: /web [on|off]")
+
+            elif cmd == "/verbose":
+                if not arg:
+                    print(f"当前详细调试日志: {'on（输出到 stderr）' if VERBOSE else 'off'}")
+                elif arg.lower() in ("on", "off"):
+                    VERBOSE = arg.lower() == "on"
+                    print("已开启详细调试日志，输出到 stderr。" if VERBOSE else "已关闭详细调试日志。")
+                else:
+                    print("用法: /verbose [on|off]")
 
             elif cmd == "/history":
                 msgs = session["messages"]
@@ -2055,6 +2142,8 @@ API Key 优先级：--api-key > 环境变量 > config 文件
   anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
   gemini=GEMINI_API_KEY        openai_responses=ARK_API_KEY
 
+调试日志：--verbose 或 FRZ_VERBOSE=1；写入 stderr，不记录 API Key 和请求正文。
+
 model 和 base url 按 provider 分别保存，切换 provider 互不影响。
 
 进入会话后输入 /help 查看斜杠命令（/save /resume /export /edit /history 等），
@@ -2069,7 +2158,7 @@ def build_arg_parser():
         # 会少算宽度导致续行对不齐，这里手工对齐（续行缩进 = "用法: frz " 的显示宽度）
         usage="frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n"
               "          [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]\n"
-              "          [--session-name NAME] [--list-sessions] {config,rename,clean} ...",
+              "          [--session-name NAME] [--list-sessions] [--verbose] {config,rename,clean} ...",
         description="支持 Anthropic / OpenAI / Gemini / OpenAI Responses 协议四种后端",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2123,6 +2212,8 @@ def build_arg_parser():
     parser.add_argument("--resume", metavar="NAME", help="恢复指定名字的会话")
     parser.add_argument("--session-name", metavar="NAME", help="新会话的名字（不指定则自动生成）")
     parser.add_argument("--list-sessions", action="store_true", help="列出所有已保存的会话后退出")
+    parser.add_argument("--verbose", action="store_true",
+                        help="输出 HTTP/SSE 调试日志到 stderr（也可用 FRZ_VERBOSE=1）")
     parser.add_argument("--version", action="version",
                         version=f"frz {__version__} {_PLAT}  by {__author__}")
 
@@ -2130,9 +2221,13 @@ def build_arg_parser():
 
 
 def main():
+    global VERBOSE
     ensure_dirs()
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.verbose:
+        VERBOSE = True
+    _debug(f"frz {__version__}; platform={_PLAT}; verbose enabled")
     cfg = load_config()
 
     if args.subcommand == "config":

@@ -113,6 +113,61 @@ DEFAULT_BASE_URLS = {
 # Providers with true typewriter streaming (print as generated, not after full reply)
 STREAMING_PROVIDERS = {"openai_responses"}
 
+# Debug logs are opt-in and go to stderr; never print request headers, API keys,
+# or the conversation request body.
+VERBOSE = os.environ.get("FRZ_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+_DEBUG_MAX_CHARS = 12000
+
+
+def _debug(message):
+    if VERBOSE:
+        print(f"[debug] {message}", file=sys.stderr, flush=True)
+
+
+def _debug_json(value):
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(text) > _DEBUG_MAX_CHARS:
+        return text[:_DEBUG_MAX_CHARS] + f"...<truncated {len(text) - _DEBUG_MAX_CHARS} chars>"
+    return text
+
+
+def _debug_url(url):
+    # URLs such as Gemini's may carry a key query parameter; redact userinfo and
+    # common credential parameters before logging.
+    url = re.sub(r"(https?://)[^/@\s]+@", r"\1<redacted>@", url)
+    return re.sub(r"([?&](?:key|api[-_]?key|access_token)=)[^&]*",
+                  r"\1<redacted>", url, flags=re.IGNORECASE)
+
+
+def _debug_response_headers(headers):
+    if not VERBOSE or not headers:
+        return
+    # Allowlist troubleshooting fields rather than exposing cookies or unrelated data.
+    for name in ("content-type", "x-request-id", "request-id", "x-tt-logid",
+                 "trace-id", "x-trace-id", "retry-after"):
+        value = headers.get(name)
+        if value:
+            _debug(f"response {name}: {value}")
+
+
+def _upstream_error_detail(evt):
+    response = evt.get("response")
+    if not isinstance(response, dict):
+        response = {}
+    error = response.get("error") or evt.get("error")
+    parts = []
+    if response.get("id"):
+        parts.append(f"response_id={response['id']}")
+    if isinstance(error, dict):
+        for key in ("code", "type", "message", "param"):
+            if error.get(key):
+                parts.append(f"{key}={error[key]}")
+    elif error:
+        parts.append(str(error))
+    # Some upstreams return only a status or a nonstandard error object; preserve
+    # that information instead of collapsing it into "unknown error".
+    return "; ".join(parts) if parts else _debug_json(evt)
+
 # Attachment limits. Oversized files are rejected, never silently truncated.
 MAX_ATTACHMENTS = 8
 MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024
@@ -549,15 +604,25 @@ def _attachment_labels(message):
 def _http_post_json(url, headers, payload, timeout=300):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    started = time.monotonic()
+    _debug(f"HTTP POST {_debug_url(url)}; timeout={timeout}s; body={len(data)} bytes")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            _debug(f"HTTP {resp.status} {resp.reason}; elapsed={time.monotonic() - started:.2f}s")
+            _debug_response_headers(resp.headers)
+            body = resp.read()
+            _debug(f"HTTP response body: {len(body)} bytes")
+            return json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as e:
+        _debug(f"HTTP {e.code}; elapsed={time.monotonic() - started:.2f}s")
+        _debug_response_headers(e.headers)
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code}: {body}") from e
     except urllib.error.URLError as e:
+        _debug(f"request failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"network error: {e.reason}") from e
     except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        _debug(f"request failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"failed to read response: {e}") from e
 
 
@@ -689,8 +754,13 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
     full_text = []
     current_event = None
     completed = False
+    started = time.monotonic()
+    _debug(f"HTTP POST {_debug_url(url)}; model={model}; web_search={web_search}; "
+           f"messages={len(input_items)}; timeout=300s")
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
+            _debug(f"HTTP {resp.status} {resp.reason}; elapsed={time.monotonic() - started:.2f}s")
+            _debug_response_headers(resp.headers)
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
@@ -711,10 +781,17 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
                 try:
                     evt = json.loads(data_str)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    _debug(f"invalid SSE JSON: {e}; data={data_str[:2000]!r}")
                     continue
 
                 etype = evt.get("type") or event_for_data
+                if etype in ("response.output_text.delta", "response.reasoning_summary_text.delta"):
+                    # Do not duplicate answer/reasoning text in logs; retain event timing
+                    # and delta sizes instead.
+                    _debug(f"SSE {etype}: delta_chars={len(evt.get('delta') or '')}")
+                else:
+                    _debug(f"SSE {etype or '<unknown>'}: {_debug_json(evt)}")
 
                 if etype == "response.output_text.delta":
                     delta_text = evt.get("delta", "")
@@ -734,11 +811,7 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
                         on_search(etype.rsplit(".", 1)[-1])
 
                 elif etype in ("error", "response.failed"):
-                    response = evt.get("response", {})
-                    err = response.get("error", {}).get("message")
-                    if not err:
-                        err = evt.get("error", {}).get("message", "unknown error")
-                    raise RuntimeError(f"upstream error: {err}")
+                    raise RuntimeError(f"upstream error: {_upstream_error_detail(evt)}")
 
                 elif etype == "response.incomplete":
                     response = evt.get("response", {})
@@ -748,17 +821,24 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
 
                 elif etype == "response.completed":
                     completed = True
+                    if not full_text:
+                        _debug("response.completed received without output text")
                     break
 
     except urllib.error.HTTPError as e:
+        _debug(f"HTTP {e.code}; elapsed={time.monotonic() - started:.2f}s")
+        _debug_response_headers(e.headers)
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code}: {body}") from e
     except urllib.error.URLError as e:
+        _debug(f"stream failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"network error: {e.reason}") from e
     except (TimeoutError, ConnectionError, http.client.HTTPException, OSError) as e:
+        _debug(f"stream failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"failed to read response stream: {e}") from e
 
     if not completed:
+        _debug(f"stream ended before response.completed; elapsed={time.monotonic() - started:.2f}s")
         raise RuntimeError("stream ended before response.completed; partial answer discarded")
     return "".join(full_text)
 
@@ -1550,7 +1630,7 @@ def _page_text(text):
 # Slash commands offered for Tab completion (sorted for a readable completion menu)
 _REPL_COMMANDS = sorted([
     "/help", "/save", "/rename", "/resume", "/list", "/new", "/export", "/edit",
-    "/system", "/model", "/baseurl", "/web", "/history", "/clear", "/exit", "/quit",
+    "/system", "/model", "/baseurl", "/web", "/verbose", "/history", "/clear", "/exit", "/quit",
 ])
 
 
@@ -1617,6 +1697,8 @@ Available commands:
                          openai_responses and similar providers)
     /web [on|off]        View or control web search; new Responses sessions
                          default to on and the model decides when to search
+    /verbose [on|off]    View or toggle HTTP/SSE debug logs for this process
+                         (logs go to stderr; not saved in the session)
 
   Local commands & attachments (openai_responses)
     !<command>           Run a local command, e.g. !ls -la; output stays local
@@ -1746,6 +1828,7 @@ def _edit_in_editor():
 
 
 def repl(session, api_key):
+    global VERBOSE
     provider = session["provider"]
     print(f"frz {__version__}  session \"{session['name']}\"  provider={provider}  model={session['model']}")
     print("Type /help for commands, /exit to save and quit.\n")
@@ -1962,6 +2045,16 @@ def repl(session, api_key):
                 else:
                     print("usage: /web [on|off]")
 
+            elif cmd == "/verbose":
+                if not arg:
+                    print(f"verbose debug logging: {'on (stderr)' if VERBOSE else 'off'}")
+                elif arg.lower() in ("on", "off"):
+                    VERBOSE = arg.lower() == "on"
+                    print("verbose debug logging enabled; logs go to stderr." if VERBOSE
+                          else "verbose debug logging disabled.")
+                else:
+                    print("usage: /verbose [on|off]")
+
             elif cmd == "/history":
                 msgs = session["messages"]
                 if not msgs:
@@ -2096,6 +2189,9 @@ API key precedence: --api-key > environment variable > config file
   anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
   gemini=GEMINI_API_KEY        openai_responses=ARK_API_KEY
 
+Debug logging: --verbose or FRZ_VERBOSE=1; logs go to stderr without API keys
+or conversation request bodies.
+
 Models and base urls are stored per provider and never leak across providers.
 
 Once inside a session, type /help for slash commands (/save /resume /export
@@ -2108,7 +2204,7 @@ def build_arg_parser():
         prog="frz",
         usage="frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n"
               "          [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]\n"
-              "          [--session-name NAME] [--list-sessions] [--version]\n"
+              "          [--session-name NAME] [--list-sessions] [--verbose] [--version]\n"
               "          {config,rename,clean} ...",
         description="supports Anthropic / OpenAI / Gemini / OpenAI Responses backends",
         epilog=EPILOG,
@@ -2162,6 +2258,8 @@ def build_arg_parser():
     parser.add_argument("--resume", metavar="NAME", help="resume the named session")
     parser.add_argument("--session-name", metavar="NAME", help="name for the new session (auto-generated if omitted)")
     parser.add_argument("--list-sessions", action="store_true", help="list saved sessions and exit")
+    parser.add_argument("--verbose", action="store_true",
+                        help="write HTTP/SSE debug logs to stderr (or set FRZ_VERBOSE=1)")
     parser.add_argument("--version", action="version",
                         version=f"frz {__version__} {_PLAT}  by {__author__}")
 
@@ -2169,9 +2267,13 @@ def build_arg_parser():
 
 
 def main():
+    global VERBOSE
     ensure_dirs()
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.verbose:
+        VERBOSE = True
+    _debug(f"frz {__version__}; platform={_PLAT}; verbose enabled")
     cfg = load_config()
 
     if args.subcommand == "config":
