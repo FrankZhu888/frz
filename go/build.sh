@@ -6,7 +6,7 @@
 #   VERSION=v1.1.0 ./build.sh
 set -e
 
-VERSION=${VERSION:-v1.5.2}
+VERSION=${VERSION:-v1.6.0}
 BUILD_TIME=$(date +%Y-%m-%d)
 # -s -w strips the symbol table and debug info (smaller binaries, harder to disassemble)
 LDFLAGS="-s -w -X main.version=$VERSION -X main.buildTime=$BUILD_TIME"
