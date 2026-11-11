@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func jsonText(s string) string {
@@ -86,14 +87,20 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	started := time.Now()
+	debugf("HTTP POST %s; model=%s; web_search=%t; messages=%d; no overall timeout",
+		debugURL(req.URL.String()), model, webSearch, len(items))
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		debugf("request failed: %T: %v", err, err)
 		if ctx.Err() == context.Canceled {
 			return "", errInterrupted
 		}
 		return "", fmt.Errorf("network error: %v", err)
 	}
 	defer resp.Body.Close()
+	debugf("HTTP %s; elapsed=%.2fs", resp.Status, time.Since(started).Seconds())
+	debugResponseHeaders(resp.Header)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
@@ -118,10 +125,19 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 				currentEvent = ""
 				if dataStr != "" && dataStr != "[DONE]" {
 					var evt map[string]interface{}
-					if json.Unmarshal([]byte(dataStr), &evt) == nil {
+					if err := json.Unmarshal([]byte(dataStr), &evt); err == nil {
 						etype := asString(evt["type"])
 						if etype == "" {
 							etype = eventForData
+						}
+						if etype == "response.output_text.delta" || etype == "response.reasoning_summary_text.delta" {
+							// Do not duplicate answer/reasoning text in logs; retain event timing and sizes.
+							debugf("SSE %s: delta_chars=%d", etype, len([]rune(asString(evt["delta"]))))
+						} else {
+							if etype == "" {
+								etype = "<unknown>"
+							}
+							debugf("SSE %s: %s", etype, debugJSON(evt))
 						}
 						switch {
 						case etype == "response.output_text.delta":
@@ -141,15 +157,7 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 								onSearch(parts[len(parts)-1])
 							}
 						case etype == "error" || etype == "response.failed":
-							response := asMap(evt["response"])
-							msg := asString(asMap(response["error"])["message"])
-							if msg == "" {
-								msg = asString(asMap(evt["error"])["message"])
-							}
-							if msg == "" {
-								msg = "unknown error"
-							}
-							return "", fmt.Errorf("upstream error: %s", msg)
+							return "", fmt.Errorf("upstream error: %s", upstreamErrorDetail(evt))
 						case etype == "response.incomplete":
 							response := asMap(evt["response"])
 							details := asMap(response["status_details"])
@@ -163,7 +171,16 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 							return "", fmt.Errorf("incomplete upstream response: %s", reason)
 						case etype == "response.completed":
 							completed = true
+							if full.Len() == 0 {
+								debugf("response.completed received without output text")
+							}
 						}
+					} else {
+						dataRunes := []rune(dataStr)
+						if len(dataRunes) > 2000 {
+							dataRunes = dataRunes[:2000]
+						}
+						debugf("invalid SSE JSON: %v; data=%q", err, string(dataRunes))
 					}
 				}
 			}
@@ -175,6 +192,8 @@ func callOpenAIResponses(ctx context.Context, messages []Message, system, model,
 			if ctx.Err() == context.Canceled {
 				return "", errInterrupted
 			}
+			debugf("stream ended before response.completed; elapsed=%.2fs; error=%v",
+				time.Since(started).Seconds(), readErr)
 			return "", fmt.Errorf("stream ended prematurely (before response.completed): %v", readErr)
 		}
 	}

@@ -105,6 +105,87 @@ var defaultBaseURLs = map[string]string{
 // Providers with true typewriter streaming (print as generated)
 var streamingProviders = map[string]bool{"openai_responses": true}
 
+// Debug logs are opt-in and go to stderr; never print request headers, API keys,
+// or the conversation request body.
+var verbose = envBool("FRZ_VERBOSE")
+
+const debugMaxChars = 12000
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+func debugf(format string, args ...interface{}) {
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[debug] "+format+"\n", args...)
+	}
+}
+
+func debugJSON(v interface{}) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("<unserializable: %v>", err)
+	}
+	runes := []rune(string(data))
+	if len(runes) > debugMaxChars {
+		return string(runes[:debugMaxChars]) + fmt.Sprintf("...<truncated %d chars>", len(runes)-debugMaxChars)
+	}
+	return string(runes)
+}
+
+var (
+	debugUserinfoRE   = regexp.MustCompile(`(https?://)[^/@\s]+@`)
+	debugCredentialRE = regexp.MustCompile(`(?i)([?&](?:key|api[-_]?key|access_token)=)[^&]*`)
+)
+
+func debugURL(raw string) string {
+	raw = debugUserinfoRE.ReplaceAllString(raw, "${1}<redacted>@")
+	return debugCredentialRE.ReplaceAllString(raw, "${1}<redacted>")
+}
+
+func debugResponseHeaders(headers http.Header) {
+	if !verbose {
+		return
+	}
+	// Allowlist troubleshooting fields rather than exposing cookies or unrelated data.
+	for _, name := range []string{"content-type", "x-request-id", "request-id", "x-tt-logid",
+		"trace-id", "x-trace-id", "retry-after"} {
+		if value := headers.Get(name); value != "" {
+			debugf("response %s: %s", name, value)
+		}
+	}
+}
+
+func upstreamErrorDetail(evt map[string]interface{}) string {
+	response := asMap(evt["response"])
+	errorValue := response["error"]
+	if errorValue == nil || len(asMap(errorValue)) == 0 && asMap(errorValue) != nil {
+		errorValue = evt["error"]
+	}
+	parts := []string{}
+	if id := asString(response["id"]); id != "" {
+		parts = append(parts, "response_id="+id)
+	}
+	if errorMap := asMap(errorValue); errorMap != nil {
+		for _, key := range []string{"code", "type", "message", "param"} {
+			if value, ok := errorMap[key]; ok && value != nil && fmt.Sprint(value) != "" {
+				parts = append(parts, fmt.Sprintf("%s=%v", key, value))
+			}
+		}
+	} else if errorValue != nil {
+		parts = append(parts, fmt.Sprint(errorValue))
+	}
+	// Preserve nonstandard failures instead of collapsing them into "unknown error".
+	if len(parts) == 0 {
+		return debugJSON(evt)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // --------------------------------------------------------------------------
 // Basic utilities
 // --------------------------------------------------------------------------
@@ -377,18 +458,25 @@ func httpPostJSON(ctx context.Context, url string, headers map[string]string, pa
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	started := time.Now()
+	debugf("HTTP POST %s; body=%d bytes; no overall timeout", debugURL(url), len(data))
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		debugf("request failed: %T: %v", err, err)
 		if ctx.Err() == context.Canceled {
 			return nil, errInterrupted
 		}
 		return nil, fmt.Errorf("network error: %v", err)
 	}
 	defer resp.Body.Close()
+	debugf("HTTP %s; elapsed=%.2fs", resp.Status, time.Since(started).Seconds())
+	debugResponseHeaders(resp.Header)
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
+		debugf("response read failed: %T: %v", readErr, readErr)
 		return nil, fmt.Errorf("failed to read response: %v", readErr)
 	}
+	debugf("HTTP response body: %d bytes", len(body))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
@@ -1441,7 +1529,7 @@ func pageText(text string) {
 // Slash commands offered for Tab completion
 var replCommands = []string{
 	"/baseurl", "/clear", "/edit", "/exit", "/export", "/help", "/history",
-	"/list", "/model", "/new", "/quit", "/rename", "/resume", "/save", "/system", "/web",
+	"/list", "/model", "/new", "/quit", "/rename", "/resume", "/save", "/system", "/web", "/verbose",
 }
 
 type frzCompleter struct{}
@@ -1505,6 +1593,8 @@ const helpText = `Available commands:
                          openai_responses and similar providers)
     /web [on|off]        View or control web search; new Responses sessions
                          default to on and the model decides when to search
+    /verbose [on|off]    View or toggle HTTP/SSE debug logs for this process
+                         (logs go to stderr; not saved in the session)
 
   Local commands & attachments (openai_responses)
     !<command>           Run a local command, e.g. !ls -la; output stays local
@@ -1879,6 +1969,21 @@ func repl(session *Session, apiKey string) {
 					fmt.Println("usage: /web [on|off]")
 				}
 
+			case "/verbose":
+				normalizedArg := strings.ToLower(arg)
+				if normalizedArg == "" {
+					fmt.Printf("verbose debug logging: %s\n", map[bool]string{true: "on (stderr)", false: "off"}[verbose])
+				} else if normalizedArg == "on" || normalizedArg == "off" {
+					verbose = normalizedArg == "on"
+					if verbose {
+						fmt.Println("verbose debug logging enabled; logs go to stderr.")
+					} else {
+						fmt.Println("verbose debug logging disabled.")
+					}
+				} else {
+					fmt.Println("usage: /verbose [on|off]")
+				}
+
 			case "/history":
 				msgs := session.Messages
 				if len(msgs) == 0 {
@@ -1987,7 +2092,7 @@ func resumedAPIKey(previousProvider, newProvider, currentKey string) string {
 
 const helpUsage = `usage: frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]
            [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]
-           [--session-name NAME] [--list-sessions] [--version]
+           [--session-name NAME] [--list-sessions] [--verbose] [--version]
            {config,rename,clean} ...
 
 options:
@@ -2002,6 +2107,7 @@ options:
   --resume NAME        resume the named session
   --session-name NAME  name for the new session (auto-generated if omitted)
   --list-sessions      list saved sessions and exit
+  --verbose            write HTTP/SSE debug logs to stderr (or set FRZ_VERBOSE=1)
   --version            show version info and exit
 
 subcommands:
@@ -2024,6 +2130,9 @@ Examples:
 API key precedence: --api-key > environment variable > config file
   anthropic=ANTHROPIC_API_KEY  openai=OPENAI_API_KEY
   gemini=GEMINI_API_KEY        openai_responses=ARK_API_KEY
+
+Debug logging: --verbose or FRZ_VERBOSE=1; logs go to stderr without API keys
+or conversation request bodies.
 
 Models and base urls are stored per provider and never leak across providers.
 
@@ -2070,7 +2179,7 @@ var mainFlagNames = map[string]bool{
 	"system": true, "resume": true, "session-name": true,
 }
 
-var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true, "web": true, "no-web": true}
+var mainBoolFlags = map[string]bool{"list-sessions": true, "version": true, "web": true, "no-web": true, "verbose": true}
 
 func main() {
 	ensureDirs()
@@ -2110,7 +2219,7 @@ func main() {
 		fmt.Println(err)
 		fmt.Print("usage: frz [-h] [--provider PROVIDER] [--model MODEL] [--api-key KEY]\n" +
 			"           [--base-url URL] [--system PROMPT] [--resume NAME] [--web|--no-web]\n" +
-			"           [--session-name NAME] [--list-sessions] [--version]\n" +
+			"           [--session-name NAME] [--list-sessions] [--verbose] [--version]\n" +
 			"           {config,rename,clean} ...\n")
 		os.Exit(1)
 	}
@@ -2122,6 +2231,10 @@ func main() {
 		fmt.Println(versionString())
 		return
 	}
+	if flags["verbose"] == "true" {
+		verbose = true
+	}
+	debugf("frz %s; platform=%s/%s; verbose enabled", version, runtime.GOOS, runtime.GOARCH)
 	listOnly := flags["list-sessions"] == "true"
 	cfg := loadConfig()
 
