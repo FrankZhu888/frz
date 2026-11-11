@@ -8,7 +8,8 @@ crafted Markdown rendering experience. Available in Go and Python editions:
 - **`python/frz-cn`** — the Chinese-localized single-file stdlib-only edition
 
 Both the Go and Python editions include local shell commands, file/image
-attachments, content-addressed attachment storage, and automatic web search.
+attachments, content-addressed attachment storage, automatic web search, and
+opt-in verbose diagnostics.
 
 ## Features
 
@@ -34,6 +35,9 @@ attachments, content-addressed attachment storage, and automatic web search.
 - **Automatic web search**: Responses models decide when to search. New Responses
   sessions default to enabled; control it with `/web on|off` or `--web/--no-web`.
   Search activity and thinking status are shown while waiting (Go and Python editions)
+- **Opt-in diagnostics**: enable HTTP/SSE debug logs with `--verbose` or
+  `FRZ_VERBOSE=1`, and toggle them interactively with `/verbose on|off`. Logs go
+  to stderr and are never enabled by default (Go and Python editions)
 - **Comfortable REPL**: slash commands, Tab completion (commands, session names,
   and attachment paths), `/edit` for multi-line input in `$EDITOR`, `/history [N]`
   with automatic paging, and a shimmer thinking spinner
@@ -110,6 +114,7 @@ frz --resume my-session  # resume a saved session
 frz --list-sessions
 frz --web                # explicitly enable automatic web search
 frz --no-web             # start a new session with web search disabled
+frz --verbose            # enable HTTP/SSE diagnostics from the first request
 ```
 
 API key resolution order: `--api-key` > environment variable > config file
@@ -128,11 +133,55 @@ API key resolution order: `--api-key` > environment variable > config file
 | `/system [prompt]` | View or set the system prompt |
 | `/model [name]` | View or switch model |
 | `/baseurl [url]` | View or set the API base URL |
-| `/web [on\|off]` | View or control automatic web search |
+| `/web [on\|off]` | View or control automatic web search (saved with the session) |
+| `/verbose [on\|off]` | View or toggle debug logs (current process only) |
 | `/edit` | Compose a multi-line message in `$EDITOR` |
 | `/history [N]` | Show history (last N rounds only; long output is paged) |
 | `/clear` | Clear current session history |
 | `/exit` | Save and quit |
+
+## Web search and diagnostics
+
+Startup options establish the initial state; REPL commands change it while
+chatting. Their persistence rules are intentionally different:
+
+| Setting | Startup | REPL | Scope |
+|---|---|---|---|
+| Web search | `--web` / `--no-web` | `/web [on\|off]` | Saved with the session |
+| Verbose logging | `--verbose` or `FRZ_VERBOSE=1` | `/verbose [on\|off]` | Current process only; not saved |
+
+Web search is enabled by default for new Responses sessions. Enabling it allows
+the model to use the search tool; **it does not force a search on every request**.
+Use `/web` without an argument to check the current session's setting.
+
+Verbose logging is off by default. Enable it from the first request, or toggle it
+inside the REPL:
+
+```bash
+frz --resume my-session --verbose
+FRZ_VERBOSE=1 frz --resume my-session
+# Accepted environment values: 1, true, yes, on (case-insensitive)
+```
+
+```text
+/verbose on     # enable HTTP/SSE diagnostics
+/verbose        # show the current state
+/verbose off    # disable diagnostics
+```
+
+Logs go to **stderr** and include HTTP status and timing, request IDs such as
+`X-Request-Id` / `X-Tt-Logid`, web-search state, SSE event details, and network
+or premature-EOF errors. Upstream failures retain available response IDs and
+error codes instead of collapsing into `unknown error`. To save diagnostics:
+
+```bash
+frz --resume my-session --verbose 2>frz-debug.log
+```
+
+API keys, authorization headers, and conversation request bodies are not
+intentionally logged. Text/reasoning deltas are represented by their lengths;
+other SSE events are logged as JSON (up to 12,000 characters per event) and may
+contain response content. Review debug logs before sharing them.
 
 ## Local commands and attachments (Go and Python editions)
 
@@ -156,7 +205,7 @@ commands, attachments, storage, web search, sessions, permissions, and SSE error
 handling:
 
 ```bash
-# Go: 30 test functions plus race detection
+# Go: 37 test functions plus race detection
 cd go && go test ./... && go test -race ./...
 
 # Python: 32 feature and regression tests

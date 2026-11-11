@@ -608,8 +608,10 @@ def _http_post_json(url, headers, payload, timeout=300):
     _debug(f"HTTP POST {_debug_url(url)}; timeout={timeout}s; body={len(data)} bytes")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            _debug(f"HTTP {resp.status} {resp.reason}; elapsed={time.monotonic() - started:.2f}s")
-            _debug_response_headers(resp.headers)
+            if VERBOSE:
+                _debug(f"HTTP {getattr(resp, 'status', getattr(resp, 'code', 'unknown'))} "
+                       f"{getattr(resp, 'reason', '')}; elapsed={time.monotonic() - started:.2f}s")
+                _debug_response_headers(getattr(resp, "headers", None))
             body = resp.read()
             _debug(f"HTTP response body: {len(body)} bytes")
             return json.loads(body.decode("utf-8"))
@@ -759,8 +761,10 @@ def call_openai_responses(messages, system, model, api_key, max_tokens=8192, bas
            f"messages={len(input_items)}; timeout=300s")
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
-            _debug(f"HTTP {resp.status} {resp.reason}; elapsed={time.monotonic() - started:.2f}s")
-            _debug_response_headers(resp.headers)
+            if VERBOSE:
+                _debug(f"HTTP {getattr(resp, 'status', getattr(resp, 'code', 'unknown'))} "
+                       f"{getattr(resp, 'reason', '')}; elapsed={time.monotonic() - started:.2f}s")
+                _debug_response_headers(getattr(resp, "headers", None))
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
