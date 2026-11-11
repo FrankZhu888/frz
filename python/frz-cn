@@ -45,7 +45,7 @@ frz - 一个类似 Gemini CLI 的多模型命令行聊天工具。
       --model kimi-k3 --base-url https://ark.cn-beijing.volces.com/api/plan/v3 --api-key ark-xxxx
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 __author__ = "Frank Zhu <flankeroot@gmail.com>"
 
 import argparse
